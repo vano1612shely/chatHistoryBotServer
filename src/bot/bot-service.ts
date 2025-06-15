@@ -1,8 +1,8 @@
 import { Telegraf, Context } from "telegraf";
 
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { ClientService } from "../client/client-service";
-import { bots } from "../database/schema";
+import { bots, messageMedia, messages } from "../database/schema";
 import { db } from "../database";
 import { MessageService } from "../telegram/message-service";
 import { TelegramMediaService } from "../telegram/media-service";
@@ -589,8 +589,79 @@ export class BotService {
     if (message.text) {
       messageText += message.text;
     }
-    // Якщо є медіа, відправляємо з медіа
-    if (message.media && message.media.length > 0) {
+
+    // Перевіряємо чи це медіа-група
+    if (message.isMediaGroup && message.groupedId) {
+      // Отримуємо всі медіа з групи
+      const mediaGroupItems = await this.getMediaGroupItems(message.id);
+
+      if (mediaGroupItems && mediaGroupItems.length > 0) {
+        try {
+          // Готуємо медіа для відправки групою
+          const mediaGroup = [];
+
+          for (let i = 0; i < mediaGroupItems.length; i++) {
+            const mediaItem = mediaGroupItems[i];
+
+            if (mediaItem.localFilePath) {
+              const buffer = await fs.readFile(mediaItem.localFilePath);
+
+              let mediaObject;
+              if (mediaItem.type === "photo") {
+                mediaObject = {
+                  type: "photo" as const,
+                  media: { source: buffer },
+                  caption: i === 0 ? messageText : undefined, // Підпис тільки до першого елемента
+                };
+              } else if (mediaItem.type === "video") {
+                mediaObject = {
+                  type: "video" as const,
+                  media: { source: buffer },
+                  caption: i === 0 ? messageText : undefined,
+                };
+              } else if (mediaItem.type === "audio") {
+                mediaObject = {
+                  type: "audio" as const,
+                  media: { source: buffer },
+                  caption: i === 0 ? messageText : undefined,
+                };
+              } else {
+                mediaObject = {
+                  type: "document" as const,
+                  media: { source: buffer },
+                  caption: i === 0 ? messageText : undefined,
+                };
+              }
+
+              mediaGroup.push(mediaObject);
+            }
+          }
+
+          if (mediaGroup.length > 0) {
+            // Відправляємо медіа-групу
+            const sentMessages = await ctx.replyWithMediaGroup(mediaGroup);
+
+            // Відправляємо навігаційні кнопки окремим повідомленням
+            const navigationMessage = await ctx.reply("🔘 Навігація:", {
+              reply_markup: keyboard,
+            });
+
+            this.sessionService.setLastTelegramMessage(
+              userId,
+              navigationMessage.message_id,
+            );
+
+            return;
+          }
+        } catch (error) {
+          console.error("Помилка відправки медіа-групи:", error);
+          // Fallback - відправляємо як звичайне повідомлення
+        }
+      }
+    }
+
+    // Якщо є звичайне медіа (не група), відправляємо як раніше
+    if (message.media && message.media.length > 0 && !message.isMediaGroup) {
       const media = message.media[0]; // Беремо перше медіа
 
       try {
@@ -646,7 +717,7 @@ export class BotService {
       } catch (error) {
         console.error("Помилка відправки медіа:", error);
         // Відправляємо тільки текст при помилці
-        const sentMessage = await ctx.reply({
+        const sentMessage = await ctx.reply(messageText, {
           reply_markup: keyboard,
         });
         this.sessionService.setLastTelegramMessage(
@@ -663,6 +734,43 @@ export class BotService {
         userId,
         sentMessage.message_id,
       );
+    }
+  }
+  private async getMediaGroupItems(messageId: string) {
+    try {
+      // Отримуємо основне повідомлення
+      const mainMessage = await db
+        .select()
+        .from(messages)
+        .where(eq(messages.id, messageId))
+        .limit(1);
+
+      if (mainMessage.length === 0 || !mainMessage[0].isMediaGroup) {
+        return null;
+      }
+
+      // Отримуємо всі медіа для цього повідомлення та пов'язаних
+      const allMessageIds = [messageId];
+
+      // Знаходимо всі дочірні повідомлення
+      const childMessages = await db
+        .select()
+        .from(messages)
+        .where(eq(messages.parentMessageId, messageId));
+
+      allMessageIds.push(...childMessages.map((msg) => msg.id));
+
+      // Отримуємо всі медіа файли для цієї групи
+      const mediaItems = await db
+        .select()
+        .from(messageMedia)
+        .where(inArray(messageMedia.messageId, allMessageIds))
+        .orderBy(messageMedia.createdAt); // Сортуємо за часом створення
+
+      return mediaItems;
+    } catch (error) {
+      console.error("Помилка отримання медіа-групи:", error);
+      return null;
     }
   }
   // Метод для отримання активних ботів

@@ -22,6 +22,13 @@ export interface AuthData {
   password?: string;
 }
 
+interface PendingMediaGroup {
+  messages: Api.Message[];
+  timeout: NodeJS.Timeout;
+  channelId: string;
+  groupedId: string;
+}
+
 export class TelegramService extends EventEmitter {
   private client: TelegramClient;
   private isStarted = false;
@@ -29,6 +36,9 @@ export class TelegramService extends EventEmitter {
   private mediaService: TelegramMediaService;
   private downloadMedia: boolean;
   private stopTimeout: NodeJS.Timeout | null = null;
+  private pendingMediaGroups: Map<string, PendingMediaGroup> = new Map();
+  private readonly MEDIA_GROUP_TIMEOUT = 2000; // 2 секунды ожидания для группировки
+
   constructor(config: TelegramConfig) {
     super();
     const stringSession = new StringSession(config.sessionString || "");
@@ -58,56 +68,23 @@ export class TelegramService extends EventEmitter {
         if (!allowedChannelsService.isChannelAllowed(channelId)) {
           return;
         }
-        try {
-          const [createdMsg] = await db
-            .insert(messages)
-            .values({
-              channelId,
-              messageId: message.id,
-              text: message.message || "",
-              date: new Date(Number(message.date) * 1000),
-            })
-            .returning();
 
-          let mediaPath: string | null = null;
-          if (message.media && this.downloadMedia) {
-            mediaPath = await this.mediaService.downloadAndSaveMedia(
-              this.client,
-              message,
-              createdMsg.id,
-            );
-          }
-
-          this.emit("newMessage", {
-            channelId,
-            messageId: message.id,
-            text: message.message,
-            date: new Date(Number(message.date) * 1000),
-            media: !!message.media,
-            mediaPath,
-          });
-
-          console.log(
-            `💬 Нове повідомлення з каналу ${channelId}: ${message.message}${mediaPath ? ` [медіа: ${mediaPath}]` : ""}`,
-          );
-        } catch (error) {
-          console.error("Error saving message:", error);
-          this.emit("error", error);
+        // Проверяем, является ли сообщение частью медиа-группы
+        if (message.groupedId) {
+          await this.handleMediaGroupMessage(message, channelId);
+        } else {
+          // Обычное сообщение
+          await this.handleSingleMessage(message, channelId);
         }
       }
 
       // Обработка удаления сообщений
       if (update.className === "UpdateDeleteChannelMessages") {
         const u = update as Api.UpdateDeleteChannelMessages;
-        const channelId = u.channelId.toString();
         const deletedMessageIds = u.messages;
 
-        if (!allowedChannelsService.isChannelAllowed(channelId)) {
-          return;
-        }
-
         try {
-          await this.handleDeletedMessages(channelId, deletedMessageIds);
+          await this.handleDeletedMessages(deletedMessageIds);
         } catch (error) {
           console.error("Error handling deleted messages:", error);
           this.emit("error", error);
@@ -116,29 +93,170 @@ export class TelegramService extends EventEmitter {
     });
   }
 
+  private async handleMediaGroupMessage(
+    message: Api.Message,
+    channelId: string,
+  ) {
+    const groupedId = message.groupedId!.toString();
+    const groupKey = `${channelId}_${groupedId}`;
+
+    if (this.pendingMediaGroups.has(groupKey)) {
+      // Добавляем сообщение к существующей группе
+      const pendingGroup = this.pendingMediaGroups.get(groupKey)!;
+      pendingGroup.messages.push(message);
+
+      // Сбрасываем таймер
+      clearTimeout(pendingGroup.timeout);
+      pendingGroup.timeout = setTimeout(() => {
+        this.processMediaGroup(groupKey);
+      }, this.MEDIA_GROUP_TIMEOUT);
+    } else {
+      // Создаем новую группу
+      const timeout = setTimeout(() => {
+        this.processMediaGroup(groupKey);
+      }, this.MEDIA_GROUP_TIMEOUT);
+
+      this.pendingMediaGroups.set(groupKey, {
+        messages: [message],
+        timeout,
+        channelId,
+        groupedId,
+      });
+    }
+  }
+
+  private async processMediaGroup(groupKey: string) {
+    const pendingGroup = this.pendingMediaGroups.get(groupKey);
+    if (!pendingGroup) return;
+
+    const { messages: groupMessages, channelId, groupedId } = pendingGroup;
+
+    // Сортируем сообщения по ID для правильного порядка
+    groupMessages.sort((a, b) => a.id - b.id);
+
+    try {
+      // Создаем основное сообщение (первое в группе)
+      const mainMessage = groupMessages[0];
+      const [createdMsg] = await db
+        .insert(messages)
+        .values({
+          channelId,
+          messageId: mainMessage.id,
+          text: mainMessage.message || "",
+          date: new Date(Number(mainMessage.date) * 1000),
+          groupedId: groupedId,
+          isMediaGroup: true,
+        })
+        .returning();
+
+      const mediaPaths: string[] = [];
+
+      // Обрабатываем все медиа из группы
+      for (const msg of groupMessages) {
+        if (msg.media && this.downloadMedia) {
+          const mediaPath = await this.mediaService.downloadAndSaveMedia(
+            this.client,
+            msg,
+            createdMsg.id,
+          );
+          if (mediaPath) {
+            mediaPaths.push(mediaPath);
+          }
+        }
+      }
+
+      // Создаем дополнительные записи для остальных сообщений группы (для связи)
+      for (let i = 1; i < groupMessages.length; i++) {
+        const msg = groupMessages[i];
+        await db.insert(messages).values({
+          channelId,
+          messageId: msg.id,
+          text: "", // Текст только в главном сообщении
+          date: new Date(Number(msg.date) * 1000),
+          groupedId: groupedId,
+          isMediaGroup: false, // Дополнительные сообщения группы
+          parentMessageId: createdMsg.id, // Ссылка на главное сообщение
+        });
+      }
+
+      this.emit("newMessage", {
+        channelId,
+        messageId: mainMessage.id,
+        text: mainMessage.message,
+        date: new Date(Number(mainMessage.date) * 1000),
+        media: true,
+        mediaPaths,
+        isMediaGroup: true,
+        mediaGroupCount: groupMessages.length,
+      });
+
+      console.log(
+        `💬 Нова медіа-група з каналу ${channelId}: ${mainMessage.message} [${groupMessages.length} елементів]`,
+      );
+    } catch (error) {
+      console.error("Error saving media group:", error);
+      this.emit("error", error);
+    } finally {
+      // Очищаем pending группу
+      clearTimeout(pendingGroup.timeout);
+      this.pendingMediaGroups.delete(groupKey);
+    }
+  }
+
+  private async handleSingleMessage(message: Api.Message, channelId: string) {
+    try {
+      const [createdMsg] = await db
+        .insert(messages)
+        .values({
+          channelId,
+          messageId: message.id,
+          text: message.message || "",
+          date: new Date(Number(message.date) * 1000),
+          isMediaGroup: false,
+        })
+        .returning();
+
+      let mediaPath: string | null = null;
+      if (message.media && this.downloadMedia) {
+        mediaPath = await this.mediaService.downloadAndSaveMedia(
+          this.client,
+          message,
+          createdMsg.id,
+        );
+      }
+
+      this.emit("newMessage", {
+        channelId,
+        messageId: message.id,
+        text: message.message,
+        date: new Date(Number(message.date) * 1000),
+        media: !!message.media,
+        mediaPath,
+        isMediaGroup: false,
+      });
+
+      console.log(
+        `💬 Нове повідомлення з каналу ${channelId}: ${message.message}${mediaPath ? ` [медіа: ${mediaPath}]` : ""}`,
+      );
+    } catch (error) {
+      console.error("Error saving message:", error);
+      this.emit("error", error);
+    }
+  }
+
   /**
    * Обрабатывает удаление сообщений из канала
    */
-  private async handleDeletedMessages(
-    channelId: string,
-    messageIds: number[],
-  ): Promise<void> {
+  private async handleDeletedMessages(messageIds: number[]): Promise<void> {
     try {
       // Находим сообщения в БД по channelId и messageId
       const messagesToDelete = await db
         .select()
         .from(messages)
-        .where(
-          and(
-            eq(messages.channelId, channelId),
-            inArray(messages.messageId, messageIds),
-          ),
-        );
+        .where(and(inArray(messages.messageId, messageIds)));
 
       if (messagesToDelete.length === 0) {
-        console.log(
-          `🔍 Повідомлення для видалення в каналі ${channelId} не знайдено`,
-        );
+        console.log(`🔍 Повідомлення для видалення в каналі не знайдено`);
         return;
       }
 
@@ -148,22 +266,24 @@ export class TelegramService extends EventEmitter {
         await this.mediaService.deleteMediaByMessageId(dbMessageId);
       }
 
+      // Также удаляем связанные сообщения медиа-группы
+      for (const msg of messagesToDelete) {
+        if (msg.isMediaGroup && msg.groupedId) {
+          // Удаляем все связанные сообщения медиа-группы
+          await db.delete(messages).where(eq(messages.parentMessageId, msg.id));
+        }
+      }
+
       const deletedMessages = await db
         .delete(messages)
-        .where(
-          and(
-            eq(messages.channelId, channelId),
-            inArray(messages.messageId, messageIds),
-          ),
-        )
+        .where(and(inArray(messages.messageId, messageIds)))
         .returning();
 
       console.log(
-        `🗑️ Видалено ${deletedMessages.length} повідомлень з каналу ${channelId}: [${messageIds.join(", ")}]`,
+        `🗑️ Видалено ${deletedMessages.length} повідомлень з каналу: [${messageIds.join(", ")}]`,
       );
 
       this.emit("messagesDeleted", {
-        channelId,
         deletedMessageIds: messageIds,
         deletedCount: deletedMessages.length,
       });
@@ -222,6 +342,19 @@ export class TelegramService extends EventEmitter {
     try {
       await this.mediaService.deleteMediaByMessageId(messageDbId);
 
+      // Если это медиа-группа, удаляем все связанные сообщения
+      const message = await db
+        .select()
+        .from(messages)
+        .where(eq(messages.id, messageDbId))
+        .limit(1);
+
+      if (message.length > 0 && message[0].isMediaGroup) {
+        await db
+          .delete(messages)
+          .where(eq(messages.parentMessageId, messageDbId));
+      }
+
       const deletedRows = await db
         .delete(messages)
         .where(eq(messages.id, messageDbId))
@@ -240,6 +373,7 @@ export class TelegramService extends EventEmitter {
       return false;
     }
   }
+
   async deleteMessageByChannelAndId(
     channelId: string,
     messageId: number,
@@ -317,6 +451,7 @@ export class TelegramService extends EventEmitter {
 
     return this.startPromise;
   }
+
   async delete(sessionId: string): Promise<string> {
     await this.stop();
     const deletedRows = await db
@@ -325,6 +460,7 @@ export class TelegramService extends EventEmitter {
       .returning();
     return "Deleted";
   }
+
   async stop(): Promise<void> {
     if (!this.client || !this.isStarted) {
       console.log("🟡 Telegram client already stopped or not started");
@@ -333,6 +469,14 @@ export class TelegramService extends EventEmitter {
 
     try {
       console.log("🔄 Stopping Telegram client...");
+
+      // Очищаем все pending медиа-группы
+      for (const [key, pendingGroup] of this.pendingMediaGroups) {
+        clearTimeout(pendingGroup.timeout);
+        // Обрабатываем незавершенные группы
+        await this.processMediaGroup(key);
+      }
+      this.pendingMediaGroups.clear();
 
       // Створюємо Promise з timeout
       const disconnectPromise = new Promise<void>((resolve, reject) => {
@@ -379,6 +523,7 @@ export class TelegramService extends EventEmitter {
       this.cleanup();
     }
   }
+
   private forceStop(): void {
     console.log("🚨 Force stopping Telegram client...");
 
@@ -394,6 +539,7 @@ export class TelegramService extends EventEmitter {
 
     this.cleanup();
   }
+
   private cleanup(): void {
     this.isStarted = false;
     this.startPromise = null;
@@ -403,13 +549,21 @@ export class TelegramService extends EventEmitter {
       this.stopTimeout = null;
     }
 
+    // Очищаем pending медиа-группы
+    for (const pendingGroup of this.pendingMediaGroups.values()) {
+      clearTimeout(pendingGroup.timeout);
+    }
+    this.pendingMediaGroups.clear();
+
     console.log("🔴 Telegram userbot зупинено!");
     this.emit("stopped");
   }
+
   async quickStop(): Promise<void> {
     console.log("⚡ Quick stopping Telegram client...");
     this.forceStop();
   }
+
   getSessionString(): string {
     try {
       return this.client.session.save() as unknown as string;

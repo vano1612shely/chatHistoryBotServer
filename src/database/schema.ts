@@ -55,15 +55,18 @@ export const telegramSessions = pgTable("telegram_sessions", {
 });
 
 export const messages = pgTable("messages", {
-  id: text("id")
+  id: varchar("id")
     .primaryKey()
-    .$defaultFn(() => crypto.randomUUID()),
+    .default(sql`gen_random_uuid()`),
+  channelId: varchar("channel_id").notNull(),
   messageId: integer("message_id").notNull(),
-  channelId: varchar("channel_id", { length: 255 }).notNull(),
-  text: text("text"),
-  date: timestamp("date", { mode: "date" }).notNull(),
+  text: text("text").default(""),
+  date: timestamp("date").notNull(),
+  groupedId: varchar("grouped_id"), // Новое поле для медиа-групп
+  isMediaGroup: boolean("is_media_group").default(false), // Флаг медиа-группы
+  parentMessageId: varchar("parent_message_id"), // Ссылка на родительское сообщение
+  createdAt: timestamp("created_at").defaultNow(),
 });
-
 export const messageMedia = pgTable("message_media", {
   id: text("id")
     .primaryKey()

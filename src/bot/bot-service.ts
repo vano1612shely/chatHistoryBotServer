@@ -35,6 +35,7 @@ export class BotService {
   private channelsService = allowedChannelsService;
   private sessionService = new UserSessionService();
   private messageService = new MessageService();
+
   constructor() {
     const start = async () => {
       const bots = await this.getAllBots();
@@ -42,6 +43,7 @@ export class BotService {
     };
     start();
   }
+
   async createBot(botData: BotData) {
     try {
       const testBot = new Telegraf(botData.token);
@@ -307,55 +309,28 @@ export class BotService {
     };
   }
 
-  private setupBotHandlers(botData: any, bot: Telegraf) {
-    bot.start(async (ctx: Context) => {
-      try {
-        const userData = {
-          telegramId: ctx.from?.id.toString() || "",
-          username: ctx.from?.username,
-          firstName: ctx.from?.first_name,
-          lastName: ctx.from?.last_name,
-          botId: botData.id,
-        };
+  // Винесена логіка start в окремий метод
+  private async handleStartLogic(ctx: Context, botData: any) {
+    try {
+      const userData = {
+        telegramId: ctx.from?.id.toString() || "",
+        username: ctx.from?.username,
+        firstName: ctx.from?.first_name,
+        lastName: ctx.from?.last_name,
+        botId: botData.id,
+      };
 
-        const user = await this.userService.findOrCreateUser(userData);
-        const userId = ctx.from?.id.toString() || "";
+      const user = await this.userService.findOrCreateUser(userData);
+      const userId = ctx.from?.id.toString() || "";
 
-        // Очищуємо сесію користувача
-        this.sessionService.clearUserSession(userId);
+      // Очищуємо сесію користувача
+      this.sessionService.clearUserSession(userId);
 
-        // Отримуємо список дозволених каналів
-        const channels = await this.channelsService.getAllChannels();
-        let message;
-        if (channels.length === 0) {
-          if (botData.startMessageFile) {
-            try {
-              const imageBuffer = Buffer.from(
-                botData.startMessageFile,
-                "base64",
-              );
+      // Отримуємо список дозволених каналів
+      const channels = await this.channelsService.getAllChannels();
+      let message;
 
-              message = await ctx.replyWithPhoto(
-                { source: imageBuffer },
-                {
-                  caption: botData.startMessage,
-                },
-              );
-            } catch (imageError) {
-              console.error("Помилка відправки картинки:", imageError);
-              message = await ctx.reply(botData.startMessage);
-            }
-          } else {
-            message = await ctx.reply(botData.startMessage);
-          }
-          this.sessionService.setLastTelegramMessage(
-            userId,
-            message.message_id,
-          );
-          return;
-        }
-
-        const keyboard = this.createChannelsKeyboard(channels);
+      if (channels.length === 0) {
         if (botData.startMessageFile) {
           try {
             const imageBuffer = Buffer.from(botData.startMessageFile, "base64");
@@ -364,27 +339,54 @@ export class BotService {
               { source: imageBuffer },
               {
                 caption: botData.startMessage,
-                reply_markup: keyboard,
               },
             );
           } catch (imageError) {
             console.error("Помилка відправки картинки:", imageError);
-            // Якщо не вдається відправити картинку, відправляємо звичайне повідомлення
-            message = await ctx.reply(botData.startMessage, {
-              reply_markup: keyboard,
-            });
+            message = await ctx.reply(botData.startMessage);
           }
         } else {
+          message = await ctx.reply(botData.startMessage);
+        }
+        this.sessionService.setLastTelegramMessage(userId, message.message_id);
+        return;
+      }
+
+      const keyboard = this.createChannelsKeyboard(channels);
+      if (botData.startMessageFile) {
+        try {
+          const imageBuffer = Buffer.from(botData.startMessageFile, "base64");
+
+          message = await ctx.replyWithPhoto(
+            { source: imageBuffer },
+            {
+              caption: botData.startMessage,
+              reply_markup: keyboard,
+            },
+          );
+        } catch (imageError) {
+          console.error("Помилка відправки картинки:", imageError);
+          // Якщо не вдається відправити картинку, відправляємо звичайне повідомлення
           message = await ctx.reply(botData.startMessage, {
             reply_markup: keyboard,
           });
         }
-
-        this.sessionService.setLastTelegramMessage(userId, message.message_id);
-      } catch (error) {
-        console.error("Помилка обробки /start:", error);
-        await ctx.reply("Try later");
+      } else {
+        message = await ctx.reply(botData.startMessage, {
+          reply_markup: keyboard,
+        });
       }
+
+      this.sessionService.setLastTelegramMessage(userId, message.message_id);
+    } catch (error) {
+      console.error("Помилка обробки start логіки:", error);
+      await ctx.reply("Try later");
+    }
+  }
+
+  private setupBotHandlers(botData: any, bot: Telegraf) {
+    bot.start(async (ctx: Context) => {
+      await this.handleStartLogic(ctx, botData);
     });
 
     // Обробник inline кнопок
@@ -404,7 +406,7 @@ export class BotService {
         } else if (data === "prev") {
           await this.handlePrevious(ctx, userId);
         } else if (data === "exit") {
-          await this.handleExit(ctx, userId);
+          await this.handleExit(ctx, userId, botData);
         }
       } catch (error) {
         console.error("Помилка обробки callback:", error);
@@ -445,27 +447,30 @@ export class BotService {
     return { inline_keyboard: buttons };
   }
 
+  // Створюємо клавіатуру тільки з кнопкою "Назад" для порожніх каналів
+  private createEmptyChannelKeyboard() {
+    return {
+      inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
+    };
+  }
+
   private async handleChannelSelection(ctx: any, data: string, userId: string) {
     const channelId = data.replace("channel_", "");
     this.sessionService.setCurrentChannel(userId, channelId);
 
-    // Видаляємо попереднє повідомлення
-    const lastMessageId = this.sessionService.getLastTelegramMessage(userId);
-    if (lastMessageId) {
-      try {
-        await ctx.deleteMessage(lastMessageId);
-      } catch (error) {
-        console.warn("Не вдалося видалити повідомлення:", error);
-      }
-    }
+    // Видаляємо попередні повідомлення
+    await this.deletePreviousMessages(ctx, userId);
 
     // Отримуємо перший пост каналу
     const firstMessage =
       await this.messageService.getFirstMessageByChannelId(channelId);
 
     if (!firstMessage) {
+      // Показуємо повідомлення про відсутність даних з кнопкою "Назад"
+      const keyboard = this.createEmptyChannelKeyboard();
       const message = await ctx.reply(
-        "📭 У цьому каналі немає збережених постів.",
+        "📭 У цьому каналі наразі немає збережених постів.\n\n💡 Дані можуть з'явитися пізніше, коли канал буде оновлено.",
+        { reply_markup: keyboard },
       );
       this.sessionService.setLastTelegramMessage(userId, message.message_id);
       return;
@@ -493,15 +498,8 @@ export class BotService {
       return;
     }
 
-    // Видаляємо попереднє повідомлення
-    const lastMessageId = this.sessionService.getLastTelegramMessage(userId);
-    if (lastMessageId) {
-      try {
-        await ctx.deleteMessage(lastMessageId);
-      } catch (error) {
-        console.warn("Не вдалося видалити повідомлення:", error);
-      }
-    }
+    // Видаляємо попередні повідомлення
+    await this.deletePreviousMessages(ctx, userId);
 
     await this.sendMessageWithNavigation(ctx, nextMessage, userId);
   }
@@ -525,32 +523,49 @@ export class BotService {
       return;
     }
 
-    // Видаляємо попереднє повідомлення
-    const lastMessageId = this.sessionService.getLastTelegramMessage(userId);
-    if (lastMessageId) {
-      try {
-        await ctx.deleteMessage(lastMessageId);
-      } catch (error) {
-        console.warn("Не вдалося видалити повідомлення:", error);
-      }
-    }
+    // Видаляємо попередні повідомлення
+    await this.deletePreviousMessages(ctx, userId);
 
     await this.sendMessageWithNavigation(ctx, prevMessage, userId);
   }
 
-  private async handleExit(ctx: any, userId: string) {
-    // Видаляємо поточне повідомлення
+  private async handleExit(ctx: any, userId: string, botData: any) {
+    // Видаляємо всі попередні повідомлення
+    await this.deletePreviousMessages(ctx, userId);
+
+    // Викликаємо ту ж саму логіку що і в /start
+    await this.handleStartLogic(ctx, botData);
+  }
+
+  // Новий метод для видалення попередніх повідомлень
+  private async deletePreviousMessages(ctx: any, userId: string) {
+    // Видаляємо повідомлення навігації
     const lastMessageId = this.sessionService.getLastTelegramMessage(userId);
     if (lastMessageId) {
       try {
         await ctx.deleteMessage(lastMessageId);
       } catch (error) {
-        console.warn("Не вдалося видалити повідомлення:", error);
+        console.warn("Не вдалося видалити навігаційне повідомлення:", error);
       }
     }
 
-    // Очищуємо сесію
-    this.sessionService.clearUserSession(userId);
+    // Видаляємо повідомлення медіа-групи
+    const mediaGroupMessageIds =
+      this.sessionService.getMediaGroupMessageIds(userId);
+    if (mediaGroupMessageIds && mediaGroupMessageIds.length > 0) {
+      for (const messageId of mediaGroupMessageIds) {
+        try {
+          await ctx.deleteMessage(messageId);
+        } catch (error) {
+          console.warn(
+            `Не вдалося видалити повідомлення медіа-групи ${messageId}:`,
+            error,
+          );
+        }
+      }
+      // Очищуємо список ID медіа-групи
+      this.sessionService.clearMediaGroupMessageIds(userId);
+    }
   }
 
   private async sendMessageWithNavigation(
@@ -640,6 +655,10 @@ export class BotService {
           if (mediaGroup.length > 0) {
             // Відправляємо медіа-групу
             const sentMessages = await ctx.replyWithMediaGroup(mediaGroup);
+
+            // Зберігаємо ID повідомлень медіа-групи
+            const messageIds = sentMessages.map((msg: any) => msg.message_id);
+            this.sessionService.setMediaGroupMessageIds(userId, messageIds);
 
             // Відправляємо навігаційні кнопки окремим повідомленням
             const navigationMessage = await ctx.reply("🔘 Навігація:", {
@@ -736,6 +755,7 @@ export class BotService {
       );
     }
   }
+
   private async getMediaGroupItems(messageId: string) {
     try {
       // Отримуємо основне повідомлення
@@ -773,6 +793,7 @@ export class BotService {
       return null;
     }
   }
+
   // Метод для отримання активних ботів
   getActiveBots() {
     return this.activeBots;

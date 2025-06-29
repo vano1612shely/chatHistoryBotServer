@@ -4,6 +4,7 @@ export interface UserSession {
   currentMessageId?: string;
   currentMessageDate?: Date;
   lastMessageId?: number; // ID повідомлення в Telegram для видалення
+  mediaGroupMessageIds?: number[]; // ID повідомлень медіа-групи для видалення
 }
 
 export class UserSessionService {
@@ -66,5 +67,27 @@ export class UserSessionService {
   getLastTelegramMessage(userId: string): number | null {
     const session = this.getUserSession(userId);
     return session?.lastMessageId || null;
+  }
+
+  // Методи для роботи з медіа-групами
+  setMediaGroupMessageIds(userId: string, messageIds: number[]): void {
+    this.setUserSession(userId, { mediaGroupMessageIds: messageIds });
+  }
+
+  getMediaGroupMessageIds(userId: string): number[] | null {
+    const session = this.getUserSession(userId);
+    return session?.mediaGroupMessageIds || null;
+  }
+
+  clearMediaGroupMessageIds(userId: string): void {
+    this.setUserSession(userId, { mediaGroupMessageIds: undefined });
+  }
+
+  // Додатковий метод для повного очищення всіх повідомлень
+  clearAllMessages(userId: string): void {
+    this.setUserSession(userId, {
+      lastMessageId: undefined,
+      mediaGroupMessageIds: undefined,
+    });
   }
 }

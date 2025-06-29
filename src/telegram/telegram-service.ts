@@ -247,6 +247,7 @@ export class TelegramService extends EventEmitter {
       if (doc instanceof Api.Document) {
         // Перевіряємо розмір файлу (максимум 45 МБ для безпечної відправки)
         const maxSize = 45 * 1024 * 1024; // 45 MB
+        //@ts-ignore
         if (doc.size && doc.size > maxSize) {
           console.warn(
             `⚠️ Файл занадто великий: ${doc.size} bytes (макс: ${maxSize})`,
@@ -257,6 +258,7 @@ export class TelegramService extends EventEmitter {
         // Для відео додатково перевіряємо розмір (максимум 30 МБ)
         if (doc.mimeType && doc.mimeType.startsWith("video/")) {
           const maxVideoSize = 30 * 1024 * 1024; // 30 MB для відео
+          //@ts-ignore
           if (doc.size && doc.size > maxVideoSize) {
             console.warn(
               `⚠️ Відео занадто велике: ${doc.size} bytes (макс для відео: ${maxVideoSize})`,

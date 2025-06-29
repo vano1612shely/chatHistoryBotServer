@@ -1,9 +1,8 @@
-import { TelegramClient } from "telegram";
+import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
-import { Api } from "telegram";
 import { db } from "../database";
-import { messages, messageMedia, telegramSessions } from "../database/schema";
-import { eq, and, inArray } from "drizzle-orm";
+import { messages, telegramSessions } from "../database/schema";
+import { and, eq, inArray } from "drizzle-orm";
 import { EventEmitter } from "events";
 import { TelegramMediaService } from "./media-service";
 import { allowedChannelsService } from "./allowed-channels-service";
@@ -27,6 +26,7 @@ interface PendingMediaGroup {
   timeout: NodeJS.Timeout;
   channelId: string;
   groupedId: string;
+  mainMessage: Api.Message | null; // Основне повідомлення з текстом
 }
 
 export class TelegramService extends EventEmitter {
@@ -37,7 +37,7 @@ export class TelegramService extends EventEmitter {
   private downloadMedia: boolean;
   private stopTimeout: NodeJS.Timeout | null = null;
   private pendingMediaGroups: Map<string, PendingMediaGroup> = new Map();
-  private readonly MEDIA_GROUP_TIMEOUT = 2000; // 2 секунды ожидания для группировки
+  private readonly MEDIA_GROUP_TIMEOUT = 3000; // Збільшено до 3 секунд для більш надійної групування
 
   constructor(config: TelegramConfig) {
     super();
@@ -105,6 +105,13 @@ export class TelegramService extends EventEmitter {
       const pendingGroup = this.pendingMediaGroups.get(groupKey)!;
       pendingGroup.messages.push(message);
 
+      // Визначаємо основне повідомлення (з текстом або перше за замовчуванням)
+      if (message.message && message.message.trim()) {
+        pendingGroup.mainMessage = message;
+      } else if (!pendingGroup.mainMessage) {
+        pendingGroup.mainMessage = message;
+      }
+
       // Сбрасываем таймер
       clearTimeout(pendingGroup.timeout);
       pendingGroup.timeout = setTimeout(() => {
@@ -121,6 +128,7 @@ export class TelegramService extends EventEmitter {
         timeout,
         channelId,
         groupedId,
+        mainMessage: message.message && message.message.trim() ? message : null,
       });
     }
   }
@@ -135,14 +143,32 @@ export class TelegramService extends EventEmitter {
     groupMessages.sort((a, b) => a.id - b.id);
 
     try {
-      // Создаем основное сообщение (первое в группе)
-      const mainMessage = groupMessages[0];
+      // Визначаємо основне повідомлення
+      let mainMessage = pendingGroup.mainMessage || groupMessages[0];
+
+      // Якщо основне повідомлення не має тексту, шукаємо інше з текстом
+      if (!mainMessage.message || !mainMessage.message.trim()) {
+        const messageWithText = groupMessages.find(
+          (msg) => msg.message && msg.message.trim(),
+        );
+        if (messageWithText) {
+          mainMessage = messageWithText;
+        }
+      }
+
+      // Збираємо весь текст з усіх повідомлень групи
+      const allTexts = groupMessages
+        .map((msg) => msg.message || "")
+        .filter((text) => text.trim())
+        .join(" ");
+
+      // Створюємо основне повідомлення
       const [createdMsg] = await db
         .insert(messages)
         .values({
           channelId,
           messageId: mainMessage.id,
-          text: mainMessage.message || "",
+          text: allTexts || "", // Використовуємо зібраний текст
           date: new Date(Number(mainMessage.date) * 1000),
           groupedId: groupedId,
           isMediaGroup: true,
@@ -150,48 +176,57 @@ export class TelegramService extends EventEmitter {
         .returning();
 
       const mediaPaths: string[] = [];
+      let hasValidMedia = false;
 
       // Обрабатываем все медиа из группы
       for (const msg of groupMessages) {
         if (msg.media && this.downloadMedia) {
-          const mediaPath = await this.mediaService.downloadAndSaveMedia(
-            this.client,
-            msg,
-            createdMsg.id,
-          );
-          if (mediaPath) {
-            mediaPaths.push(mediaPath);
+          // Перевіряємо чи є медіа валідним
+          if (this.isValidMediaForDownload(msg.media)) {
+            const mediaPath = await this.mediaService.downloadAndSaveMedia(
+              this.client,
+              msg,
+              createdMsg.id,
+            );
+            if (mediaPath) {
+              mediaPaths.push(mediaPath);
+              hasValidMedia = true;
+            }
+          } else {
+            console.warn(`⚠️ Пропущено медіа через розмір або тип: ${msg.id}`);
           }
         }
       }
 
       // Создаем дополнительные записи для остальных сообщений группы (для связи)
-      for (let i = 1; i < groupMessages.length; i++) {
-        const msg = groupMessages[i];
-        await db.insert(messages).values({
-          channelId,
-          messageId: msg.id,
-          text: "", // Текст только в главном сообщении
-          date: new Date(Number(msg.date) * 1000),
-          groupedId: groupedId,
-          isMediaGroup: false, // Дополнительные сообщения группы
-          parentMessageId: createdMsg.id, // Ссылка на главное сообщение
-        });
+      for (const msg of groupMessages) {
+        if (msg.id !== mainMessage.id) {
+          await db.insert(messages).values({
+            channelId,
+            messageId: msg.id,
+            text: "", // Текст только в главном сообщении
+            date: new Date(Number(msg.date) * 1000),
+            groupedId: groupedId,
+            isMediaGroup: false, // Дополнительные сообщения группы
+            parentMessageId: createdMsg.id, // Ссылка на главное сообщение
+          });
+        }
       }
 
       this.emit("newMessage", {
         channelId,
         messageId: mainMessage.id,
-        text: mainMessage.message,
+        text: allTexts,
         date: new Date(Number(mainMessage.date) * 1000),
-        media: true,
+        media: hasValidMedia,
         mediaPaths,
         isMediaGroup: true,
         mediaGroupCount: groupMessages.length,
+        validMediaCount: mediaPaths.length,
       });
 
       console.log(
-        `💬 Нова медіа-група з каналу ${channelId}: ${mainMessage.message} [${groupMessages.length} елементів]`,
+        `💬 Нова медіа-група з каналу ${channelId}: "${allTexts}" [${groupMessages.length} елементів, ${mediaPaths.length} медіа]`,
       );
     } catch (error) {
       console.error("Error saving media group:", error);
@@ -201,6 +236,37 @@ export class TelegramService extends EventEmitter {
       clearTimeout(pendingGroup.timeout);
       this.pendingMediaGroups.delete(groupKey);
     }
+  }
+
+  /**
+   * Перевіряє чи підходить медіа для завантаження та відправки
+   */
+  private isValidMediaForDownload(media: Api.TypeMessageMedia): boolean {
+    if (media instanceof Api.MessageMediaDocument) {
+      const doc = media.document;
+      if (doc instanceof Api.Document) {
+        // Перевіряємо розмір файлу (максимум 45 МБ для безпечної відправки)
+        const maxSize = 45 * 1024 * 1024; // 45 MB
+        if (doc.size && doc.size > maxSize) {
+          console.warn(
+            `⚠️ Файл занадто великий: ${doc.size} bytes (макс: ${maxSize})`,
+          );
+          return false;
+        }
+
+        // Для відео додатково перевіряємо розмір (максимум 30 МБ)
+        if (doc.mimeType && doc.mimeType.startsWith("video/")) {
+          const maxVideoSize = 30 * 1024 * 1024; // 30 MB для відео
+          if (doc.size && doc.size > maxVideoSize) {
+            console.warn(
+              `⚠️ Відео занадто велике: ${doc.size} bytes (макс для відео: ${maxVideoSize})`,
+            );
+            return false;
+          }
+        }
+      }
+    }
+    return true;
   }
 
   private async handleSingleMessage(message: Api.Message, channelId: string) {
@@ -217,12 +283,19 @@ export class TelegramService extends EventEmitter {
         .returning();
 
       let mediaPath: string | null = null;
+      let hasValidMedia = false;
+
       if (message.media && this.downloadMedia) {
-        mediaPath = await this.mediaService.downloadAndSaveMedia(
-          this.client,
-          message,
-          createdMsg.id,
-        );
+        if (this.isValidMediaForDownload(message.media)) {
+          mediaPath = await this.mediaService.downloadAndSaveMedia(
+            this.client,
+            message,
+            createdMsg.id,
+          );
+          hasValidMedia = !!mediaPath;
+        } else {
+          console.warn(`⚠️ Пропущено медіа через розмір: ${message.id}`);
+        }
       }
 
       this.emit("newMessage", {
@@ -230,13 +303,19 @@ export class TelegramService extends EventEmitter {
         messageId: message.id,
         text: message.message,
         date: new Date(Number(message.date) * 1000),
-        media: !!message.media,
+        media: hasValidMedia,
         mediaPath,
         isMediaGroup: false,
       });
 
+      const mediaInfo = mediaPath
+        ? ` [медіа: ${mediaPath}]`
+        : message.media && !hasValidMedia
+          ? " [медіа пропущено - великий розмір]"
+          : "";
+
       console.log(
-        `💬 Нове повідомлення з каналу ${channelId}: ${message.message}${mediaPath ? ` [медіа: ${mediaPath}]` : ""}`,
+        `💬 Нове повідомлення з каналу ${channelId}: ${message.message}${mediaInfo}`,
       );
     } catch (error) {
       console.error("Error saving message:", error);
@@ -308,6 +387,12 @@ export class TelegramService extends EventEmitter {
       });
 
       if (!message || !message.media) {
+        return null;
+      }
+
+      // Перевіряємо розмір перед завантаженням
+      if (!this.isValidMediaForDownload(message.media)) {
+        console.warn(`⚠️ Медіа ${messageId} занадто велике для завантаження`);
         return null;
       }
 

@@ -446,14 +446,57 @@ export class BotService {
 
     return { inline_keyboard: buttons };
   }
+  private async getValidMessage(
+    channelId: string,
+    messageDate: Date,
+    direction: "next" | "prev" | "first",
+  ): Promise<any> {
+    let message = null;
+    let attempts = 0;
+    const maxAttempts = 100; // Захист від нескінченного циклу
 
-  // Створюємо клавіатуру тільки з кнопкою "Назад" для порожніх каналів
-  private createEmptyChannelKeyboard() {
-    return {
-      inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
-    };
+    while (attempts < maxAttempts) {
+      switch (direction) {
+        case "first":
+          message =
+            await this.messageService.getFirstMessageByChannelId(channelId);
+          break;
+        case "next":
+          message = await this.messageService.getNextMessage(
+            channelId,
+            messageDate,
+          );
+          break;
+        case "prev":
+          message = await this.messageService.getPreviousMessage(
+            channelId,
+            messageDate,
+          );
+          break;
+      }
+      if (!message) {
+        return null; // Більше немає повідомлень
+      }
+
+      // Перевіряємо чи є контент в повідомленні
+      const hasText = message.text && message.text.trim() !== "";
+      const hasMedia = message.media && message.media.length > 0;
+
+      if (hasText || hasMedia) {
+        return message;
+      }
+
+      // Якщо повідомлення порожнє, оновлюємо дату і шукаємо далі
+      messageDate = message.date;
+      attempts++;
+    }
+
+    return null; // Не знайшли валідне повідомлення
   }
 
+  // Updated methods for BotService class
+
+  // Replace the handleChannelSelection method with this:
   private async handleChannelSelection(ctx: any, data: string, userId: string) {
     const channelId = data.replace("channel_", "");
     this.sessionService.setCurrentChannel(userId, channelId);
@@ -461,7 +504,7 @@ export class BotService {
     // Видаляємо попередні повідомлення
     await this.deletePreviousMessages(ctx, userId);
 
-    // Отримуємо перший пост каналу
+    // Отримуємо перший валідний пост каналу (фільтрація вже в БД)
     const firstMessage =
       await this.messageService.getFirstMessageByChannelId(channelId);
 
@@ -479,6 +522,7 @@ export class BotService {
     await this.sendMessageWithNavigation(ctx, firstMessage, userId);
   }
 
+  // Replace the handleNext method with this:
   private async handleNext(ctx: any, userId: string) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
     const currentMessage = this.sessionService.getCurrentMessage(userId);
@@ -504,6 +548,7 @@ export class BotService {
     await this.sendMessageWithNavigation(ctx, nextMessage, userId);
   }
 
+  // Replace the handlePrevious method with this:
   private async handlePrevious(ctx: any, userId: string) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
     const currentMessage = this.sessionService.getCurrentMessage(userId);
@@ -527,6 +572,12 @@ export class BotService {
     await this.deletePreviousMessages(ctx, userId);
 
     await this.sendMessageWithNavigation(ctx, prevMessage, userId);
+  }
+  // Створюємо клавіатуру тільки з кнопкою "Назад" для порожніх каналів
+  private createEmptyChannelKeyboard() {
+    return {
+      inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
+    };
   }
 
   private async handleExit(ctx: any, userId: string, botData: any) {
@@ -599,10 +650,13 @@ export class BotService {
       currentChannel!,
     );
 
+    // FIX: Ensure messageText is never empty
     let messageText = "";
-
-    if (message.text) {
-      messageText += message.text;
+    if (message.text && message.text.trim()) {
+      messageText = message.text.trim();
+    } else {
+      // Fallback text if original message has no text
+      messageText = `📄 Пост ${position} з ${totalCount}`;
     }
 
     // Перевіряємо чи це медіа-група
@@ -661,9 +715,12 @@ export class BotService {
             this.sessionService.setMediaGroupMessageIds(userId, messageIds);
 
             // Відправляємо навігаційні кнопки окремим повідомленням
-            const navigationMessage = await ctx.reply("🔘 Навігація:", {
-              reply_markup: keyboard,
-            });
+            const navigationMessage = await ctx.reply(
+              `🔘 Навігація: ${position}/${totalCount}`,
+              {
+                reply_markup: keyboard,
+              },
+            );
 
             this.sessionService.setLastTelegramMessage(
               userId,
@@ -724,6 +781,7 @@ export class BotService {
             );
           }
         } else {
+          // FIX: Ensure we don't send empty text
           sentMessage = await ctx.reply(messageText, {
             reply_markup: keyboard,
           });
@@ -745,7 +803,7 @@ export class BotService {
         );
       }
     } else {
-      // Відправляємо тільки текст
+      // FIX: Ensure we don't send empty text - this was likely the main issue
       const sentMessage = await ctx.reply(messageText, {
         reply_markup: keyboard,
       });

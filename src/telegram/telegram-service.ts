@@ -325,16 +325,16 @@ export class TelegramService extends EventEmitter {
     }
   }
 
-  /**
-   * Обрабатывает удаление сообщений из канала
-   */
+  getMediaService(): TelegramMediaService {
+    return this.mediaService;
+  }
   private async handleDeletedMessages(messageIds: number[]): Promise<void> {
     try {
-      // Находим сообщения в БД по channelId и messageId
+      // Находим сообщения в БД по messageId
       const messagesToDelete = await db
         .select()
         .from(messages)
-        .where(and(inArray(messages.messageId, messageIds)));
+        .where(inArray(messages.messageId, messageIds));
 
       if (messagesToDelete.length === 0) {
         console.log(`🔍 Повідомлення для видалення в каналі не знайдено`);
@@ -343,21 +343,30 @@ export class TelegramService extends EventEmitter {
 
       const dbMessageIds = messagesToDelete.map((msg) => msg.id);
 
+      // Видаляємо медіа для всіх повідомлень, які будуть видалені
       for (const dbMessageId of dbMessageIds) {
         await this.mediaService.deleteMediaByMessageId(dbMessageId);
       }
 
-      // Также удаляем связанные сообщения медиа-группы
+      // Видаляємо всі дочірні повідомлення (parentMessageId)
       for (const msg of messagesToDelete) {
-        if (msg.isMediaGroup && msg.groupedId) {
-          // Удаляем все связанные сообщения медиа-группы
-          await db.delete(messages).where(eq(messages.parentMessageId, msg.id));
+        // Видаляємо всі повідомлення, які посилаються на це як на батьківське
+        const deletedChildMessages = await db
+          .delete(messages)
+          .where(eq(messages.parentMessageId, msg.id))
+          .returning();
+
+        if (deletedChildMessages.length > 0) {
+          console.log(
+            `🗑️ Видалено ${deletedChildMessages.length} дочірніх повідомлень для повідомлення ${msg.id}`,
+          );
         }
       }
 
+      // Видаляємо основні повідомлення
       const deletedMessages = await db
         .delete(messages)
-        .where(and(inArray(messages.messageId, messageIds)))
+        .where(inArray(messages.messageId, messageIds))
         .returning();
 
       console.log(
@@ -374,10 +383,42 @@ export class TelegramService extends EventEmitter {
     }
   }
 
-  getMediaService(): TelegramMediaService {
-    return this.mediaService;
-  }
+  async deleteMessage(messageDbId: string): Promise<boolean> {
+    try {
+      // Видаляємо медіа
+      await this.mediaService.deleteMediaByMessageId(messageDbId);
 
+      // Видаляємо всі дочірні повідомлення (parentMessageId)
+      const deletedChildMessages = await db
+        .delete(messages)
+        .where(eq(messages.parentMessageId, messageDbId))
+        .returning();
+
+      if (deletedChildMessages.length > 0) {
+        console.log(
+          `🗑️ Видалено ${deletedChildMessages.length} дочірніх повідомлень для повідомлення ${messageDbId}`,
+        );
+      }
+
+      // Видаляємо основне повідомлення
+      const deletedRows = await db
+        .delete(messages)
+        .where(eq(messages.id, messageDbId))
+        .returning();
+
+      if (deletedRows.length > 0) {
+        console.log(`🗑️ Повідомлення ${messageDbId} видалено вручну`);
+        this.emit("messageDeleted", { messageId: messageDbId });
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error("Error deleting message:", error);
+      this.emit("error", error);
+      return false;
+    }
+  }
   async downloadMessageMedia(
     channelId: string,
     messageId: number,
@@ -422,42 +463,6 @@ export class TelegramService extends EventEmitter {
     } catch (error) {
       console.error("Error downloading media:", error);
       return null;
-    }
-  }
-
-  async deleteMessage(messageDbId: string): Promise<boolean> {
-    try {
-      await this.mediaService.deleteMediaByMessageId(messageDbId);
-
-      // Если это медиа-группа, удаляем все связанные сообщения
-      const message = await db
-        .select()
-        .from(messages)
-        .where(eq(messages.id, messageDbId))
-        .limit(1);
-
-      if (message.length > 0 && message[0].isMediaGroup) {
-        await db
-          .delete(messages)
-          .where(eq(messages.parentMessageId, messageDbId));
-      }
-
-      const deletedRows = await db
-        .delete(messages)
-        .where(eq(messages.id, messageDbId))
-        .returning();
-
-      if (deletedRows.length > 0) {
-        console.log(`🗑️ Повідомлення ${messageDbId} видалено вручну`);
-        this.emit("messageDeleted", { messageId: messageDbId });
-        return true;
-      }
-
-      return false;
-    } catch (error) {
-      console.error("Error deleting message:", error);
-      this.emit("error", error);
-      return false;
     }
   }
 

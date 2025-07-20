@@ -37,7 +37,7 @@ export class TelegramService extends EventEmitter {
   private downloadMedia: boolean;
   private stopTimeout: NodeJS.Timeout | null = null;
   private pendingMediaGroups: Map<string, PendingMediaGroup> = new Map();
-  private readonly MEDIA_GROUP_TIMEOUT = 3000; // Збільшено до 3 секунд для більш надійної групування
+  private readonly MEDIA_GROUP_TIMEOUT = 2000; // 2 секунди для медіа-групи
 
   constructor(config: TelegramConfig) {
     super();
@@ -69,11 +69,15 @@ export class TelegramService extends EventEmitter {
           return;
         }
 
-        // Проверяем, является ли сообщение частью медиа-группы
-        if (message.groupedId) {
+        // ВИПРАВЛЕННЯ: Медіа-група створюється тільки коли є groupedId ТА медіа
+        if (
+          message.groupedId &&
+          message.groupedId.toString().trim() !== "" &&
+          message.media
+        ) {
           await this.handleMediaGroupMessage(message, channelId);
         } else {
-          // Обычное сообщение
+          // Звичайне повідомлення (не частина медіа-групи)
           await this.handleSingleMessage(message, channelId);
         }
       }
@@ -101,7 +105,7 @@ export class TelegramService extends EventEmitter {
     const groupKey = `${channelId}_${groupedId}`;
 
     if (this.pendingMediaGroups.has(groupKey)) {
-      // Добавляем сообщение к существующей группе
+      // Додаємо повідомлення до існуючої групи
       const pendingGroup = this.pendingMediaGroups.get(groupKey)!;
       pendingGroup.messages.push(message);
 
@@ -112,13 +116,13 @@ export class TelegramService extends EventEmitter {
         pendingGroup.mainMessage = message;
       }
 
-      // Сбрасываем таймер
+      // Скидаємо таймер
       clearTimeout(pendingGroup.timeout);
       pendingGroup.timeout = setTimeout(() => {
         this.processMediaGroup(groupKey);
       }, this.MEDIA_GROUP_TIMEOUT);
     } else {
-      // Создаем новую группу
+      // Створюємо нову групу
       const timeout = setTimeout(() => {
         this.processMediaGroup(groupKey);
       }, this.MEDIA_GROUP_TIMEOUT);
@@ -139,7 +143,7 @@ export class TelegramService extends EventEmitter {
 
     const { messages: groupMessages, channelId, groupedId } = pendingGroup;
 
-    // Сортируем сообщения по ID для правильного порядка
+    // Сортуємо повідомлення по ID для правильного порядку
     groupMessages.sort((a, b) => a.id - b.id);
 
     try {
@@ -168,47 +172,66 @@ export class TelegramService extends EventEmitter {
         .values({
           channelId,
           messageId: mainMessage.id,
-          text: allTexts || "", // Використовуємо зібраний текст
+          text: allTexts || "",
           date: new Date(Number(mainMessage.date) * 1000),
           groupedId: groupedId,
           isMediaGroup: true,
+          parentMessageId: null,
         })
         .returning();
 
       const mediaPaths: string[] = [];
       let hasValidMedia = false;
+      let compressionUsed = false;
 
-      // Обрабатываем все медиа из группы
+      // Обробляємо всі медіа з групи
       for (const msg of groupMessages) {
         if (msg.media && this.downloadMedia) {
-          // Перевіряємо чи є медіа валідним
           if (this.isValidMediaForDownload(msg.media)) {
-            const mediaPath = await this.mediaService.downloadAndSaveMedia(
-              this.client,
-              msg,
-              createdMsg.id,
-            );
+            const needsCompress = this.needsCompression(msg.media);
+            let mediaPath: string | null = null;
+
+            if (needsCompress) {
+              console.log(
+                `🔄 Стискання медіа для групи ${groupedId}, повідомлення ${msg.id}...`,
+              );
+              mediaPath = await this.mediaService.downloadAndCompressMedia(
+                this.client,
+                msg,
+                createdMsg.id,
+              );
+              compressionUsed = true;
+            } else {
+              mediaPath = await this.mediaService.downloadAndSaveMedia(
+                this.client,
+                msg,
+                createdMsg.id,
+              );
+            }
+
             if (mediaPath) {
               mediaPaths.push(mediaPath);
               hasValidMedia = true;
             }
           } else {
-            console.warn(`⚠️ Пропущено медіа через розмір або тип: ${msg.id}`);
+            console.warn(
+              `⚠️ Медіа в групі ${groupedId} занадто велике: ${msg.id}`,
+            );
           }
         }
       }
 
-      // Создаем дополнительные записи для остальных сообщений группы (для связи)
+      // Створюємо додаткові записи для решти повідомлень групи (для зв'язку)
       for (const msg of groupMessages) {
         if (msg.id !== mainMessage.id) {
           await db.insert(messages).values({
             channelId,
             messageId: msg.id,
-            text: "", // Текст только в главном сообщении
+            text: "",
             date: new Date(Number(msg.date) * 1000),
             groupedId: groupedId,
-            isMediaGroup: false, // Дополнительные сообщения группы
-            parentMessageId: createdMsg.id, // Ссылка на главное сообщение
+            isMediaGroup: false,
+            parentMessageId: createdMsg.id,
           });
         }
       }
@@ -223,56 +246,64 @@ export class TelegramService extends EventEmitter {
         isMediaGroup: true,
         mediaGroupCount: groupMessages.length,
         validMediaCount: mediaPaths.length,
+        compressed: compressionUsed,
       });
 
       console.log(
-        `💬 Нова медіа-група з каналу ${channelId}: "${allTexts}" [${groupMessages.length} елементів, ${mediaPaths.length} медіа]`,
+        `💬 Нова медіа-група з каналу ${channelId}: "${allTexts}" [${groupMessages.length} елементів, ${mediaPaths.length} медіа${compressionUsed ? ", стиснуто" : ""}]`,
       );
     } catch (error) {
       console.error("Error saving media group:", error);
       this.emit("error", error);
     } finally {
-      // Очищаем pending группу
+      // Очищаємо pending групу
       clearTimeout(pendingGroup.timeout);
       this.pendingMediaGroups.delete(groupKey);
     }
   }
 
-  /**
-   * Перевіряє чи підходить медіа для завантаження та відправки
-   */
   private isValidMediaForDownload(media: Api.TypeMessageMedia): boolean {
     if (media instanceof Api.MessageMediaDocument) {
       const doc = media.document;
       if (doc instanceof Api.Document) {
-        // Перевіряємо розмір файлу (максимум 45 МБ для безпечної відправки)
-        const maxSize = 45 * 1024 * 1024; // 45 MB
+        const absoluteMaxSize = 100 * 1024 * 1024; // 100 MB
         //@ts-ignore
-        if (doc.size && doc.size > maxSize) {
+        if (doc.size && doc.size > absoluteMaxSize) {
           console.warn(
-            `⚠️ Файл занадто великий: ${doc.size} bytes (макс: ${maxSize})`,
+            `⚠️ Файл занадто великий навіть для стискання: ${doc.size} bytes (макс: ${absoluteMaxSize})`,
           );
           return false;
-        }
-
-        // Для відео додатково перевіряємо розмір (максимум 30 МБ)
-        if (doc.mimeType && doc.mimeType.startsWith("video/")) {
-          const maxVideoSize = 30 * 1024 * 1024; // 30 MB для відео
-          //@ts-ignore
-          if (doc.size && doc.size > maxVideoSize) {
-            console.warn(
-              `⚠️ Відео занадто велике: ${doc.size} bytes (макс для відео: ${maxVideoSize})`,
-            );
-            return false;
-          }
         }
       }
     }
     return true;
   }
 
+  private needsCompression(media: Api.TypeMessageMedia): boolean {
+    if (media instanceof Api.MessageMediaDocument) {
+      const doc = media.document;
+      if (doc instanceof Api.Document) {
+        const compressionThreshold = 45 * 1024 * 1024; // 45 MB
+        //@ts-ignore
+        if (doc.size && doc.size > compressionThreshold) {
+          if (
+            doc.mimeType &&
+            (doc.mimeType.startsWith("image/") ||
+              doc.mimeType.startsWith("video/"))
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   private async handleSingleMessage(message: Api.Message, channelId: string) {
     try {
+      // Додаємо невеликий тайм-аут для запобігання конфліктам
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * 100));
+
       const [createdMsg] = await db
         .insert(messages)
         .values({
@@ -281,22 +312,40 @@ export class TelegramService extends EventEmitter {
           text: message.message || "",
           date: new Date(Number(message.date) * 1000),
           isMediaGroup: false,
+          groupedId: null,
+          parentMessageId: null,
         })
         .returning();
 
       let mediaPath: string | null = null;
       let hasValidMedia = false;
+      let compressionUsed = false;
 
       if (message.media && this.downloadMedia) {
         if (this.isValidMediaForDownload(message.media)) {
-          mediaPath = await this.mediaService.downloadAndSaveMedia(
-            this.client,
-            message,
-            createdMsg.id,
-          );
+          const needsCompress = this.needsCompression(message.media);
+
+          if (needsCompress) {
+            console.log(`🔄 Стискання медіа для повідомлення ${message.id}...`);
+            mediaPath = await this.mediaService.downloadAndCompressMedia(
+              this.client,
+              message,
+              createdMsg.id,
+            );
+            compressionUsed = true;
+          } else {
+            mediaPath = await this.mediaService.downloadAndSaveMedia(
+              this.client,
+              message,
+              createdMsg.id,
+            );
+          }
+
           hasValidMedia = !!mediaPath;
         } else {
-          console.warn(`⚠️ Пропущено медіа через розмір: ${message.id}`);
+          console.warn(
+            `⚠️ Медіа ${message.id} занадто велике навіть для стискання`,
+          );
         }
       }
 
@@ -308,12 +357,13 @@ export class TelegramService extends EventEmitter {
         media: hasValidMedia,
         mediaPath,
         isMediaGroup: false,
+        compressed: compressionUsed,
       });
 
       const mediaInfo = mediaPath
-        ? ` [медіа: ${mediaPath}]`
+        ? ` [медіа: ${mediaPath}${compressionUsed ? " (стиснуто)" : ""}]`
         : message.media && !hasValidMedia
-          ? " [медіа пропущено - великий розмір]"
+          ? " [медіа пропущено - занадто великий]"
           : "";
 
       console.log(
@@ -328,9 +378,9 @@ export class TelegramService extends EventEmitter {
   getMediaService(): TelegramMediaService {
     return this.mediaService;
   }
+
   private async handleDeletedMessages(messageIds: number[]): Promise<void> {
     try {
-      // Находим сообщения в БД по messageId
       const messagesToDelete = await db
         .select()
         .from(messages)
@@ -343,14 +393,11 @@ export class TelegramService extends EventEmitter {
 
       const dbMessageIds = messagesToDelete.map((msg) => msg.id);
 
-      // Видаляємо медіа для всіх повідомлень, які будуть видалені
       for (const dbMessageId of dbMessageIds) {
         await this.mediaService.deleteMediaByMessageId(dbMessageId);
       }
 
-      // Видаляємо всі дочірні повідомлення (parentMessageId)
       for (const msg of messagesToDelete) {
-        // Видаляємо всі повідомлення, які посилаються на це як на батьківське
         const deletedChildMessages = await db
           .delete(messages)
           .where(eq(messages.parentMessageId, msg.id))
@@ -363,7 +410,6 @@ export class TelegramService extends EventEmitter {
         }
       }
 
-      // Видаляємо основні повідомлення
       const deletedMessages = await db
         .delete(messages)
         .where(inArray(messages.messageId, messageIds))
@@ -385,10 +431,8 @@ export class TelegramService extends EventEmitter {
 
   async deleteMessage(messageDbId: string): Promise<boolean> {
     try {
-      // Видаляємо медіа
       await this.mediaService.deleteMediaByMessageId(messageDbId);
 
-      // Видаляємо всі дочірні повідомлення (parentMessageId)
       const deletedChildMessages = await db
         .delete(messages)
         .where(eq(messages.parentMessageId, messageDbId))
@@ -400,7 +444,6 @@ export class TelegramService extends EventEmitter {
         );
       }
 
-      // Видаляємо основне повідомлення
       const deletedRows = await db
         .delete(messages)
         .where(eq(messages.id, messageDbId))
@@ -419,6 +462,7 @@ export class TelegramService extends EventEmitter {
       return false;
     }
   }
+
   async downloadMessageMedia(
     channelId: string,
     messageId: number,
@@ -433,13 +477,11 @@ export class TelegramService extends EventEmitter {
         return null;
       }
 
-      // Перевіряємо розмір перед завантаженням
       if (!this.isValidMediaForDownload(message.media)) {
         console.warn(`⚠️ Медіа ${messageId} занадто велике для завантаження`);
         return null;
       }
 
-      // Найдем запись в БД
       const dbMessage = await db
         .select()
         .from(messages)
@@ -562,29 +604,24 @@ export class TelegramService extends EventEmitter {
     try {
       console.log("🔄 Stopping Telegram client...");
 
-      // Очищаем все pending медиа-группы
       for (const [key, pendingGroup] of this.pendingMediaGroups) {
         clearTimeout(pendingGroup.timeout);
-        // Обрабатываем незавершенные группы
         await this.processMediaGroup(key);
       }
       this.pendingMediaGroups.clear();
 
-      // Створюємо Promise з timeout
       const disconnectPromise = new Promise<void>((resolve, reject) => {
         if (!this.client) {
           resolve();
           return;
         }
 
-        // Встановлюємо timeout на 5 секунд
         this.stopTimeout = setTimeout(() => {
           console.warn("⚠️ Disconnect timeout, forcing stop...");
           this.forceStop();
-          resolve(); // Resolve замість reject, щоб не кидати помилку
+          resolve();
         }, 5000);
 
-        // Спробуємо нормально відключитися
         this.client
           .disconnect()
           .then(() => {
@@ -602,7 +639,7 @@ export class TelegramService extends EventEmitter {
             }
             console.warn("⚠️ Disconnect error, forcing stop:", error.message);
             this.forceStop();
-            resolve(); // Resolve замість reject
+            resolve();
           });
       });
 
@@ -611,7 +648,6 @@ export class TelegramService extends EventEmitter {
       console.error("❌ Error during stop:", error);
       this.forceStop();
     } finally {
-      // Завжди очищуємо стан
       this.cleanup();
     }
   }

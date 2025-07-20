@@ -7,6 +7,7 @@ import allowedChannelsController from "./telegram/allowed-channels-controller";
 import { authGuard } from "./auth/auth.guard";
 import { telegramBotController } from "./bot/bot-controller";
 import { clientController } from "./client/client-controller";
+import { subscriptionController } from "./subcription/subscription-controller";
 
 const app = new Elysia({
   websocket: {
@@ -26,6 +27,7 @@ const app = new Elysia({
   .use(allowedChannelsController)
   .use(telegramBotController)
   .use(clientController)
+  .use(subscriptionController)
   .listen({ idleTimeout: 100, port: 3000 });
 
 console.log(`🚀 Сервер запущено на http://localhost:3000`);

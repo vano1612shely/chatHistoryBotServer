@@ -1,5 +1,4 @@
 import { Telegraf, Context } from "telegraf";
-
 import { eq, inArray } from "drizzle-orm";
 import { ClientService } from "../client/client-service";
 import { bots, messageMedia, messages } from "../database/schema";
@@ -9,6 +8,7 @@ import { TelegramMediaService } from "../telegram/media-service";
 import { UserSessionService } from "./user-session";
 import { allowedChannelsService } from "../telegram/allowed-channels-service";
 import fs from "fs/promises";
+import { SubscriptionService } from "../subcription/subscription-service";
 
 export interface BotData {
   name: string;
@@ -35,6 +35,7 @@ export class BotService {
   private channelsService = allowedChannelsService;
   private sessionService = new UserSessionService();
   private messageService = new MessageService();
+  private subscriptionService = new SubscriptionService();
 
   constructor() {
     const start = async () => {
@@ -127,7 +128,6 @@ export class BotService {
   }
 
   async deleteBot(botId: number) {
-    // Спочатку зупиняємо бота якщо він запущений
     if (this.activeBots.has(botId)) {
       await this.stopBot(botId);
     }
@@ -146,7 +146,6 @@ export class BotService {
 
   async getBotById(botId: number) {
     const bot = await db.select().from(bots).where(eq(bots.id, botId)).limit(1);
-
     return bot[0] || null;
   }
 
@@ -212,7 +211,6 @@ export class BotService {
               mediaOptions,
             );
             break;
-
           case "video":
             sentMessage = await bot.telegram.sendVideo(
               userTelegramId,
@@ -220,7 +218,6 @@ export class BotService {
               mediaOptions,
             );
             break;
-
           case "audio":
             sentMessage = await bot.telegram.sendAudio(
               userTelegramId,
@@ -228,7 +225,6 @@ export class BotService {
               mediaOptions,
             );
             break;
-
           case "document":
             sentMessage = await bot.telegram.sendDocument(
               userTelegramId,
@@ -241,7 +237,6 @@ export class BotService {
             break;
         }
       } else {
-        // Відправляємо тільки текстове повідомлення
         sentMessage = await bot.telegram.sendMessage(
           userTelegramId,
           messageData.message,
@@ -278,8 +273,9 @@ export class BotService {
     if (userIds && userIds.length > 0) {
       targetUsers = userIds;
     } else {
-      const users = await this.userService.getAllUsers();
-      targetUsers = users.map((user) => user.telegramId);
+      const usersWithSubscription =
+        await this.userService.getUsersWithActiveSubscription();
+      targetUsers = usersWithSubscription.map((user) => user.telegramId);
     }
 
     for (const userId of targetUsers) {
@@ -308,8 +304,66 @@ export class BotService {
       totalFailed: results.filter((r) => !r.success).length,
     };
   }
+  private async showSubscriptionMenu(
+    ctx: Context,
+    botData: any,
+    userId: string,
+    user: any,
+  ) {
+    const subscriptionPlans =
+      await this.subscriptionService.getAllSubscriptionPlans();
 
-  // Винесена логіка start в окремий метод
+    const keyboard = {
+      inline_keyboard: [
+        ...subscriptionPlans.map((plan) => [
+          {
+            text: `Оформити ${plan.name} (${plan.price} XTR)`,
+            callback_data: `subscribe_${plan.id}`,
+          },
+        ]),
+        [{ text: "❌ Закрити", callback_data: "exit" }],
+      ],
+    };
+
+    const subscriptionMessage = `
+💎 Для доступу до контенту потрібна активна підписка!
+
+Доступні плани:
+${subscriptionPlans
+  .map(
+    (plan) => `• ${plan.name}: ${plan.price} XTR (${plan.durationDays} днів)`,
+  )
+  .join("\n")}
+
+Оберіть план підписки нижче:
+`;
+
+    let message;
+    if (botData.startMessageFile) {
+      try {
+        const imageBuffer = Buffer.from(botData.startMessageFile, "base64");
+        message = await ctx.replyWithPhoto(
+          { source: imageBuffer },
+          {
+            caption: subscriptionMessage,
+            reply_markup: keyboard,
+          },
+        );
+      } catch (imageError) {
+        console.error("Помилка відправки картинки:", imageError);
+        message = await ctx.reply(subscriptionMessage, {
+          reply_markup: keyboard,
+        });
+      }
+    } else {
+      message = await ctx.reply(subscriptionMessage, {
+        reply_markup: keyboard,
+      });
+    }
+
+    this.sessionService.setLastTelegramMessage(userId, message.message_id);
+  }
+
   private async handleStartLogic(ctx: Context, botData: any) {
     try {
       const userData = {
@@ -323,40 +377,56 @@ export class BotService {
       const user = await this.userService.findOrCreateUser(userData);
       const userId = ctx.from?.id.toString() || "";
 
-      // Очищуємо сесію користувача
+      // Clear user's session
       this.sessionService.clearUserSession(userId);
 
-      // Отримуємо список дозволених каналів
+      const subscription =
+        await this.subscriptionService.getUserActiveSubscription(user.id);
+      if (!subscription) {
+        await this.showSubscriptionMenu(ctx, botData, userId, user);
+        return;
+      }
       const channels = await this.channelsService.getAllChannels();
       let message;
 
       if (channels.length === 0) {
+        const keyboard = {
+          inline_keyboard: [
+            [{ text: "💎 Моя підписка", callback_data: "my_subscription" }],
+          ],
+        };
+
         if (botData.startMessageFile) {
           try {
             const imageBuffer = Buffer.from(botData.startMessageFile, "base64");
-
             message = await ctx.replyWithPhoto(
               { source: imageBuffer },
               {
                 caption: botData.startMessage,
+                reply_markup: keyboard,
               },
             );
           } catch (imageError) {
             console.error("Помилка відправки картинки:", imageError);
-            message = await ctx.reply(botData.startMessage);
+            message = await ctx.reply(botData.startMessage, {
+              reply_markup: keyboard,
+            });
           }
         } else {
-          message = await ctx.reply(botData.startMessage);
+          message = await ctx.reply(botData.startMessage, {
+            reply_markup: keyboard,
+          });
         }
+
         this.sessionService.setLastTelegramMessage(userId, message.message_id);
         return;
       }
 
-      const keyboard = this.createChannelsKeyboard(channels);
+      const keyboard = this.createChannelsKeyboard(channels, true);
+
       if (botData.startMessageFile) {
         try {
           const imageBuffer = Buffer.from(botData.startMessageFile, "base64");
-
           message = await ctx.replyWithPhoto(
             { source: imageBuffer },
             {
@@ -366,7 +436,6 @@ export class BotService {
           );
         } catch (imageError) {
           console.error("Помилка відправки картинки:", imageError);
-          // Якщо не вдається відправити картинку, відправляємо звичайне повідомлення
           message = await ctx.reply(botData.startMessage, {
             reply_markup: keyboard,
           });
@@ -380,7 +449,7 @@ export class BotService {
       this.sessionService.setLastTelegramMessage(userId, message.message_id);
     } catch (error) {
       console.error("Помилка обробки start логіки:", error);
-      await ctx.reply("Try later");
+      await ctx.reply("Виникла помилка, спробуйте пізніше");
     }
   }
 
@@ -389,7 +458,6 @@ export class BotService {
       await this.handleStartLogic(ctx, botData);
     });
 
-    // Обробник inline кнопок
     bot.on("callback_query", async (ctx) => {
       try {
         if (!ctx.callbackQuery || !("data" in ctx.callbackQuery)) return;
@@ -398,9 +466,21 @@ export class BotService {
         const userId = ctx.from?.id.toString() || "";
 
         await ctx.answerCbQuery();
+        const user = await this.userService.findUserByTelegramId(userId);
+        if (!user) return;
 
+        const subscription =
+          await this.subscriptionService.getUserActiveSubscription(user.id);
+        if (!subscription && !data.startsWith("subscribe_")) {
+          await this.showSubscriptionMenu(ctx, botData, userId, user);
+          return;
+        }
         if (data.startsWith("channel_")) {
           await this.handleChannelSelection(ctx, data, userId);
+        } else if (data.startsWith("subscribe_")) {
+          await this.handleSubscriptionSelection(ctx, data, userId, botData);
+        } else if (data === "my_subscription") {
+          await this.handleMySubscription(ctx, userId, botData);
         } else if (data === "next") {
           await this.handleNext(ctx, userId);
         } else if (data === "prev") {
@@ -410,20 +490,153 @@ export class BotService {
         }
       } catch (error) {
         console.error("Помилка обробки callback:", error);
+        await ctx.reply("Виникла помилка, спробуйте пізніше");
       }
     });
 
-    // Обробник помилок
+    // Handle successful payment
+    bot.on("pre_checkout_query", async (ctx) => {
+      try {
+        await ctx.answerPreCheckoutQuery(true);
+      } catch (error) {
+        console.error("Помилка обробки pre_checkout_query:", error);
+        await ctx.answerPreCheckoutQuery(false, "Помилка обробки платежу");
+      }
+    });
+
+    bot.on("successful_payment", async (ctx) => {
+      try {
+        const userId = ctx.from?.id.toString() || "";
+        const user = await this.userService.findUserByTelegramId(userId);
+        if (!user) {
+          throw new Error("Користувача не знайдено");
+        }
+
+        const payment = ctx.message?.successful_payment;
+        if (!payment) {
+          throw new Error("Дані про платіж відсутні");
+        }
+
+        const planId = parseInt(payment.invoice_payload.split("_")[1]);
+        const transaction =
+          await this.subscriptionService.createSubscriptionTransaction(
+            user.id,
+            planId,
+            payment.telegram_payment_charge_id,
+            payment.provider_payment_charge_id,
+          );
+
+        await this.subscriptionService.createUserSubscription(
+          user.id,
+          planId,
+          transaction.id,
+        );
+
+        await this.deletePreviousMessages(ctx, userId);
+        await this.handleStartLogic(ctx, botData);
+
+        await ctx.reply(
+          "🎉 Оплата успішна! Ви отримали доступ до всіх функцій бота!",
+        );
+      } catch (error) {
+        console.error("Помилка обробки успішного платежу:", error);
+        await ctx.reply(
+          "Виникла помилка при обробці платежу. Зверніться до підтримки.",
+        );
+      }
+    });
+
     bot.catch((err: any) => {
       console.error("Помилка бота:", err);
     });
 
-    // Graceful stop
     process.once("SIGINT", () => bot.stop("SIGINT"));
     process.once("SIGTERM", () => bot.stop("SIGTERM"));
   }
+  private async handleMySubscription(ctx: any, userId: string, botData: any) {
+    const user = await this.userService.findUserByTelegramId(userId);
+    if (!user) {
+      await ctx.reply("Користувача не знайдено");
+      return;
+    }
 
-  private createChannelsKeyboard(channels: any[]) {
+    const subscription =
+      await this.subscriptionService.getUserActiveSubscription(user.id);
+
+    if (!subscription) {
+      await ctx.reply("У вас немає активної підписки");
+      return;
+    }
+
+    const endDate = subscription.endDate.toLocaleDateString("uk-UA", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+
+    const subscriptionInfo = `
+💎 Інформація про підписку
+
+📋 План: ${subscription.planName}
+📅 Діє до: ${endDate}
+✅ Статус: Активна
+
+Дякуємо за використання нашого сервісу!
+`;
+
+    const keyboard = {
+      inline_keyboard: [[{ text: "🔙 Назад", callback_data: "exit" }]],
+    };
+
+    await this.deletePreviousMessages(ctx, userId);
+    const message = await ctx.reply(subscriptionInfo, {
+      reply_markup: keyboard,
+    });
+    this.sessionService.setLastTelegramMessage(userId, message.message_id);
+  }
+  private async handleSubscriptionSelection(
+    ctx: any,
+    data: string,
+    userId: string,
+    botData: any,
+  ) {
+    const planId = parseInt(data.replace("subscribe_", ""));
+    const plan = await this.subscriptionService.getSubscriptionPlanById(planId);
+
+    if (!plan) {
+      await ctx.reply("Помилка: План підписки не знайдено");
+      return;
+    }
+
+    await this.deletePreviousMessages(ctx, userId);
+
+    try {
+      // Create invoice
+      const invoice = {
+        chat_id: ctx.from?.id,
+        title: `Підписка ${plan.name}`,
+        description:
+          plan.description || `Доступ до контенту на ${plan.durationDays} днів`,
+        payload: `subscription_${planId}`,
+        currency: "XTR",
+        prices: [{ label: plan.name, amount: plan.price }],
+        max_tip_amount: 0,
+        suggested_tip_amounts: [],
+      };
+
+      await ctx.replyWithInvoice(invoice);
+    } catch (error) {
+      console.error("Помилка створення інвойсу:", error);
+      await ctx.reply(
+        "Помилка при створенні платіжного запиту. Спробуйте пізніше.",
+      );
+    }
+  }
+
+  private createChannelsKeyboard(
+    channels: any[],
+    includeSubscriptionButton: boolean = false,
+  ) {
     const buttons = channels.map((channel) => [
       {
         text: channel.name || `Канал ${channel.telegramChannelId}`,
@@ -431,9 +644,14 @@ export class BotService {
       },
     ]);
 
+    if (includeSubscriptionButton) {
+      buttons.push([
+        { text: "💎 Моя підписка", callback_data: "my_subscription" },
+      ]);
+    }
+
     return { inline_keyboard: buttons };
   }
-
   private createNavigationKeyboard(hasNext: boolean, hasPrev: boolean) {
     const buttons = [];
 
@@ -446,70 +664,17 @@ export class BotService {
 
     return { inline_keyboard: buttons };
   }
-  private async getValidMessage(
-    channelId: string,
-    messageDate: Date,
-    direction: "next" | "prev" | "first",
-  ): Promise<any> {
-    let message = null;
-    let attempts = 0;
-    const maxAttempts = 100; // Захист від нескінченного циклу
 
-    while (attempts < maxAttempts) {
-      switch (direction) {
-        case "first":
-          message =
-            await this.messageService.getFirstMessageByChannelId(channelId);
-          break;
-        case "next":
-          message = await this.messageService.getNextMessage(
-            channelId,
-            messageDate,
-          );
-          break;
-        case "prev":
-          message = await this.messageService.getPreviousMessage(
-            channelId,
-            messageDate,
-          );
-          break;
-      }
-      if (!message) {
-        return null; // Більше немає повідомлень
-      }
-
-      // Перевіряємо чи є контент в повідомленні
-      const hasText = message.text && message.text.trim() !== "";
-      const hasMedia = message.media && message.media.length > 0;
-
-      if (hasText || hasMedia) {
-        return message;
-      }
-
-      // Якщо повідомлення порожнє, оновлюємо дату і шукаємо далі
-      messageDate = message.date;
-      attempts++;
-    }
-
-    return null; // Не знайшли валідне повідомлення
-  }
-
-  // Updated methods for BotService class
-
-  // Replace the handleChannelSelection method with this:
   private async handleChannelSelection(ctx: any, data: string, userId: string) {
     const channelId = data.replace("channel_", "");
     this.sessionService.setCurrentChannel(userId, channelId);
 
-    // Видаляємо попередні повідомлення
     await this.deletePreviousMessages(ctx, userId);
 
-    // Отримуємо перший валідний пост каналу (фільтрація вже в БД)
     const firstMessage =
       await this.messageService.getFirstMessageByChannelId(channelId);
 
     if (!firstMessage) {
-      // Показуємо повідомлення про відсутність даних з кнопкою "Назад"
       const keyboard = this.createEmptyChannelKeyboard();
       const message = await ctx.reply(
         "📭 У цьому каналі наразі немає збережених постів.\n\n💡 Дані можуть з'явитися пізніше, коли канал буде оновлено.",
@@ -522,7 +687,6 @@ export class BotService {
     await this.sendMessageWithNavigation(ctx, firstMessage, userId);
   }
 
-  // Replace the handleNext method with this:
   private async handleNext(ctx: any, userId: string) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
     const currentMessage = this.sessionService.getCurrentMessage(userId);
@@ -542,13 +706,10 @@ export class BotService {
       return;
     }
 
-    // Видаляємо попередні повідомлення
     await this.deletePreviousMessages(ctx, userId);
-
     await this.sendMessageWithNavigation(ctx, nextMessage, userId);
   }
 
-  // Replace the handlePrevious method with this:
   private async handlePrevious(ctx: any, userId: string) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
     const currentMessage = this.sessionService.getCurrentMessage(userId);
@@ -568,12 +729,10 @@ export class BotService {
       return;
     }
 
-    // Видаляємо попередні повідомлення
     await this.deletePreviousMessages(ctx, userId);
-
     await this.sendMessageWithNavigation(ctx, prevMessage, userId);
   }
-  // Створюємо клавіатуру тільки з кнопкою "Назад" для порожніх каналів
+
   private createEmptyChannelKeyboard() {
     return {
       inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
@@ -581,16 +740,11 @@ export class BotService {
   }
 
   private async handleExit(ctx: any, userId: string, botData: any) {
-    // Видаляємо всі попередні повідомлення
     await this.deletePreviousMessages(ctx, userId);
-
-    // Викликаємо ту ж саму логіку що і в /start
     await this.handleStartLogic(ctx, botData);
   }
 
-  // Новий метод для видалення попередніх повідомлень
   private async deletePreviousMessages(ctx: any, userId: string) {
-    // Видаляємо повідомлення навігації
     const lastMessageId = this.sessionService.getLastTelegramMessage(userId);
     if (lastMessageId) {
       try {
@@ -600,7 +754,6 @@ export class BotService {
       }
     }
 
-    // Видаляємо повідомлення медіа-групи
     const mediaGroupMessageIds =
       this.sessionService.getMediaGroupMessageIds(userId);
     if (mediaGroupMessageIds && mediaGroupMessageIds.length > 0) {
@@ -614,7 +767,6 @@ export class BotService {
           );
         }
       }
-      // Очищуємо список ID медіа-групи
       this.sessionService.clearMediaGroupMessageIds(userId);
     }
   }
@@ -626,7 +778,6 @@ export class BotService {
   ) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
 
-    // Перевіряємо чи є наступні/попередні повідомлення
     const hasNext = !!(await this.messageService.getNextMessage(
       currentChannel!,
       message.date,
@@ -636,12 +787,10 @@ export class BotService {
       message.date,
     ));
 
-    // Зберігаємо поточне повідомлення в сесію
     this.sessionService.setCurrentMessage(userId, message.id, message.date);
 
     const keyboard = this.createNavigationKeyboard(hasNext, hasPrev);
 
-    // Отримуємо позицію повідомлення
     const position = await this.messageService.getMessagePosition(
       currentChannel!,
       message.date,
@@ -650,23 +799,16 @@ export class BotService {
       currentChannel!,
     );
 
-    // FIX: Ensure messageText is never empty
     let messageText = "";
     if (message.text && message.text.trim()) {
       messageText = message.text.trim();
-    } else {
-      // Fallback text if original message has no text
-      messageText = `📄 Пост ${position} з ${totalCount}`;
     }
 
-    // Перевіряємо чи це медіа-група
     if (message.isMediaGroup && message.groupedId) {
-      // Отримуємо всі медіа з групи
       const mediaGroupItems = await this.getMediaGroupItems(message.id);
 
       if (mediaGroupItems && mediaGroupItems.length > 0) {
         try {
-          // Готуємо медіа для відправки групою
           const mediaGroup = [];
 
           for (let i = 0; i < mediaGroupItems.length; i++) {
@@ -680,7 +822,7 @@ export class BotService {
                 mediaObject = {
                   type: "photo" as const,
                   media: { source: buffer },
-                  caption: i === 0 ? messageText : undefined, // Підпис тільки до першого елемента
+                  caption: i === 0 ? messageText : undefined,
                 };
               } else if (mediaItem.type === "video") {
                 mediaObject = {
@@ -707,38 +849,28 @@ export class BotService {
           }
 
           if (mediaGroup.length > 0) {
-            // Відправляємо медіа-групу
             const sentMessages = await ctx.replyWithMediaGroup(mediaGroup);
-
-            // Зберігаємо ID повідомлень медіа-групи
             const messageIds = sentMessages.map((msg: any) => msg.message_id);
             this.sessionService.setMediaGroupMessageIds(userId, messageIds);
 
-            // Відправляємо навігаційні кнопки окремим повідомленням
-            const navigationMessage = await ctx.reply(
-              `🔘 Навігація: ${position}/${totalCount}`,
-              {
-                reply_markup: keyboard,
-              },
-            );
+            const navigationMessage = await ctx.reply(`Навігація`, {
+              reply_markup: keyboard,
+            });
 
             this.sessionService.setLastTelegramMessage(
               userId,
               navigationMessage.message_id,
             );
-
             return;
           }
         } catch (error) {
           console.error("Помилка відправки медіа-групи:", error);
-          // Fallback - відправляємо як звичайне повідомлення
         }
       }
     }
 
-    // Якщо є звичайне медіа (не група), відправляємо як раніше
     if (message.media && message.media.length > 0 && !message.isMediaGroup) {
-      const media = message.media[0]; // Беремо перше медіа
+      const media = message.media[0];
 
       try {
         let sentMessage;
@@ -749,39 +881,25 @@ export class BotService {
           if (media.type === "photo") {
             sentMessage = await ctx.replyWithPhoto(
               { source: buffer },
-              {
-                caption: messageText,
-                reply_markup: keyboard,
-              },
+              { caption: messageText, reply_markup: keyboard },
             );
           } else if (media.type === "video") {
             sentMessage = await ctx.replyWithVideo(
               { source: buffer },
-              {
-                caption: messageText,
-                reply_markup: keyboard,
-              },
+              { caption: messageText, reply_markup: keyboard },
             );
           } else if (media.type === "audio") {
             sentMessage = await ctx.replyWithAudio(
               { source: buffer },
-              {
-                caption: messageText,
-                reply_markup: keyboard,
-              },
+              { caption: messageText, reply_markup: keyboard },
             );
           } else {
-            // Для інших типів відправляємо як документ
             sentMessage = await ctx.replyWithDocument(
               { source: buffer },
-              {
-                caption: messageText,
-                reply_markup: keyboard,
-              },
+              { caption: messageText, reply_markup: keyboard },
             );
           }
         } else {
-          // FIX: Ensure we don't send empty text
           sentMessage = await ctx.reply(messageText, {
             reply_markup: keyboard,
           });
@@ -793,7 +911,6 @@ export class BotService {
         );
       } catch (error) {
         console.error("Помилка відправки медіа:", error);
-        // Відправляємо тільки текст при помилці
         const sentMessage = await ctx.reply(messageText, {
           reply_markup: keyboard,
         });
@@ -803,7 +920,6 @@ export class BotService {
         );
       }
     } else {
-      // FIX: Ensure we don't send empty text - this was likely the main issue
       const sentMessage = await ctx.reply(messageText, {
         reply_markup: keyboard,
       });
@@ -816,7 +932,6 @@ export class BotService {
 
   private async getMediaGroupItems(messageId: string) {
     try {
-      // Отримуємо основне повідомлення
       const mainMessage = await db
         .select()
         .from(messages)
@@ -827,10 +942,8 @@ export class BotService {
         return null;
       }
 
-      // Отримуємо всі медіа для цього повідомлення та пов'язаних
       const allMessageIds = [messageId];
 
-      // Знаходимо всі дочірні повідомлення
       const childMessages = await db
         .select()
         .from(messages)
@@ -838,12 +951,11 @@ export class BotService {
 
       allMessageIds.push(...childMessages.map((msg) => msg.id));
 
-      // Отримуємо всі медіа файли для цієї групи
       const mediaItems = await db
         .select()
         .from(messageMedia)
         .where(inArray(messageMedia.messageId, allMessageIds))
-        .orderBy(messageMedia.createdAt); // Сортуємо за часом створення
+        .orderBy(messageMedia.createdAt);
 
       return mediaItems;
     } catch (error) {
@@ -852,24 +964,7 @@ export class BotService {
     }
   }
 
-  // Метод для отримання активних ботів
   getActiveBots() {
     return this.activeBots;
-  }
-
-  // Метод для зупинки всіх ботів при завершенні роботи сервера
-  async stopAllBots() {
-    for (const [botId, bot] of this.activeBots) {
-      try {
-        bot.stop();
-        await db
-          .update(bots)
-          .set({ isActive: false, updatedAt: new Date() })
-          .where(eq(bots.id, botId));
-      } catch (error) {
-        console.error(`Помилка зупинки бота ${botId}:`, error);
-      }
-    }
-    this.activeBots.clear();
   }
 }

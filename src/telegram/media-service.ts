@@ -6,7 +6,8 @@ import crypto from "crypto";
 import { db } from "../database";
 import { messageMedia, messages } from "../database/schema";
 import { eq } from "drizzle-orm";
-
+import * as sharp from "sharp";
+import * as ffmpeg from "fluent-ffmpeg";
 export interface MediaFile {
   id: string;
   type: "photo" | "video" | "audio" | "voice" | "document";
@@ -33,7 +34,186 @@ export class TelegramMediaService {
       await fs.mkdir(this.mediaDir, { recursive: true });
     }
   }
+  async downloadAndCompressMedia(
+    client: TelegramClient,
+    message: Api.Message,
+    messageDbId: string,
+  ): Promise<string | null> {
+    try {
+      if (!message.media) return null;
 
+      // Спочатку завантажуємо оригінальний файл
+      const originalPath = await this.downloadAndSaveMedia(
+        client,
+        message,
+        messageDbId,
+      );
+      if (!originalPath) return null;
+
+      // Визначаємо тип медіа та стискаємо
+      const media = message.media;
+      if (media instanceof Api.MessageMediaDocument) {
+        const doc = media.document;
+        if (doc instanceof Api.Document && doc.mimeType) {
+          if (doc.mimeType.startsWith("image/")) {
+            return await this.compressImage(originalPath, messageDbId);
+          } else if (doc.mimeType.startsWith("video/")) {
+            return await this.compressVideo(originalPath, messageDbId);
+          }
+        }
+      } else if (media instanceof Api.MessageMediaPhoto) {
+        return await this.compressImage(originalPath, messageDbId);
+      }
+
+      // Якщо тип не підтримується для стискання, повертаємо оригінал
+      return originalPath;
+    } catch (error) {
+      console.error("Error downloading and compressing media:", error);
+      return null;
+    }
+  }
+
+  /**
+   * НОВА ФУНКЦІЯ: Стискає зображення
+   */
+  private async compressImage(
+    originalPath: string,
+    messageDbId: string,
+  ): Promise<string | null> {
+    try {
+      const parsedPath = path.parse(originalPath);
+      const compressedPath = path.join(
+        parsedPath.dir,
+        `${parsedPath.name}_compressed.jpg`,
+      );
+
+      // Стискаємо зображення з якістю 70% та обмежуємо розмір до 2048x2048
+      //@ts-ignore
+      await sharp(originalPath)
+        .resize(2048, 2048, {
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .jpeg({
+          quality: 70,
+          progressive: true,
+        })
+        .toFile(compressedPath);
+
+      // Перевіряємо розмір стисненого файлу
+      const compressedStats = await fs.stat(compressedPath);
+      const originalStats = await fs.stat(originalPath);
+
+      console.log(
+        `📸 Зображення стиснуто: ${originalStats.size} → ${compressedStats.size} bytes`,
+      );
+
+      // Якщо стискання успішне, видаляємо оригінал
+      await fs.unlink(originalPath);
+
+      // Оновлюємо запис в БД
+      await this.updateMediaPath(messageDbId, compressedPath);
+
+      return compressedPath;
+    } catch (error) {
+      console.error("Error compressing image:", error);
+      return originalPath; // Повертаємо оригінал у разі помилки
+    }
+  }
+
+  /**
+   * НОВА ФУНКЦІЯ: Стискає відео
+   */
+  private async compressVideo(
+    originalPath: string,
+    messageDbId: string,
+  ): Promise<string | null> {
+    try {
+      const parsedPath = path.parse(originalPath);
+      const compressedPath = path.join(
+        parsedPath.dir,
+        `${parsedPath.name}_compressed.mp4`,
+      );
+
+      return new Promise((resolve, reject) => {
+        //@ts-ignore
+        ffmpeg(originalPath)
+          .outputOptions([
+            "-c:v libx264", // Відео кодек
+            "-crf 28", // Константа якості (18-28, більше = менший файл)
+            "-preset fast", // Швидкість кодування
+            "-c:a aac", // Аудіо кодек
+            "-b:a 128k", // Бітрейт аудіо
+            "-movflags +faststart", // Оптимізація для веб
+          ])
+          .videoFilters([
+            "scale=1280:720:force_original_aspect_ratio=decrease", // Зменшуємо розмір
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2", // Додаємо відступи
+          ])
+          .output(compressedPath)
+          .on("end", async () => {
+            try {
+              // Перевіряємо розмір стисненого файлу
+              const compressedStats = await fs.stat(compressedPath);
+              const originalStats = await fs.stat(originalPath);
+
+              console.log(
+                `🎥 Відео стиснуто: ${originalStats.size} → ${compressedStats.size} bytes`,
+              );
+
+              // Видаляємо оригінал
+              await fs.unlink(originalPath);
+
+              // Оновлюємо запис в БД
+              await this.updateMediaPath(messageDbId, compressedPath);
+
+              resolve(compressedPath);
+            } catch (error) {
+              console.error("Error updating compressed video:", error);
+              resolve(originalPath);
+            }
+          })
+          .on("error", (error: any) => {
+            console.error("Error compressing video:", error);
+            resolve(originalPath);
+          })
+          .run();
+      });
+    } catch (error) {
+      console.error("Error in compressVideo:", error);
+      return originalPath;
+    }
+  }
+
+  /**
+   * НОВА ФУНКЦІЯ: Оновлює шлях до медіа в БД
+   */
+  private async updateMediaPath(
+    messageDbId: string,
+    newPath: string,
+  ): Promise<void> {
+    try {
+      await db
+        .update(messageMedia)
+        .set({ localFilePath: newPath })
+        .where(eq(messageMedia.messageId, messageDbId));
+    } catch (error) {
+      console.error("Error updating media path in DB:", error);
+    }
+  }
+
+  /**
+   * НОВА ФУНКЦІЯ: Перевіряє розмір файлу після стискання
+   */
+  private async checkCompressedSize(filePath: string): Promise<boolean> {
+    try {
+      const stats = await fs.stat(filePath);
+      const maxSize = 45 * 1024 * 1024; // 45 MB
+      return stats.size <= maxSize;
+    } catch {
+      return false;
+    }
+  }
   async downloadAndSaveMedia(
     client: TelegramClient,
     message: Api.Message,

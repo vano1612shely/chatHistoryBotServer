@@ -1,18 +1,18 @@
 import { db } from "../database";
-import { messages, messageMedia, allowedChannels } from "../database/schema";
+import { messageMedia, messages } from "../database/schema";
 import {
-  eq,
-  asc,
-  desc,
   and,
-  lt,
-  gt,
+  asc,
   count,
-  isNotNull,
-  or,
-  ne,
+  desc,
+  eq,
   exists,
+  gt,
+  isNotNull,
   isNull,
+  lt,
+  ne,
+  or,
 } from "drizzle-orm";
 
 export interface MessageWithMedia {
@@ -46,15 +46,12 @@ export class MessageService {
       or(
         // Має непорожній текст
         and(isNotNull(messages.text), ne(messages.text, "")),
-        // АБО має медіа (але перевіряємо медіа тільки для батьківських повідомлень)
-        and(
-          isNull(messages.parentMessageId), // Додаткова перевірка
-          exists(
-            db
-              .select()
-              .from(messageMedia)
-              .where(eq(messageMedia.messageId, messages.id)),
-          ),
+        // АБО має медіа
+        exists(
+          db
+            .select()
+            .from(messageMedia)
+            .where(eq(messageMedia.messageId, messages.id)),
         ),
       ),
     );
@@ -110,7 +107,7 @@ export class MessageService {
       )
       .orderBy(asc(messages.date))
       .limit(1);
-    console.log(message);
+
     if (message.length === 0) return null;
 
     return await this.getMessageWithMedia(message[0].id);
@@ -164,18 +161,6 @@ export class MessageService {
         .where(eq(messages.parentMessageId, messageId));
 
       if (childMessages.length > 0) {
-        const childMessageIds = childMessages.map((msg) => msg.id);
-        childMedia = await db
-          .select()
-          .from(messageMedia)
-          .where(
-            and(
-              eq(messageMedia.messageId, childMessageIds[0]), // Використовуємо перший ID
-              // Або використовуємо inArray якщо потрібно всі
-            ),
-          );
-
-        // Для всіх дочірніх повідомлень
         for (const childMsg of childMessages) {
           const media = await db
             .select()
@@ -186,7 +171,6 @@ export class MessageService {
       }
     }
 
-    // Об'єднуємо медіа з батьківського і дочірніх повідомлень
     const allMedia = [...parentMedia, ...childMedia];
 
     return {

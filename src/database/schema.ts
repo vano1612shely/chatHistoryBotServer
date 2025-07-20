@@ -6,6 +6,7 @@ import {
   varchar,
   boolean,
   serial,
+  decimal,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 
@@ -62,11 +63,12 @@ export const messages = pgTable("messages", {
   messageId: integer("message_id").notNull(),
   text: text("text").default(""),
   date: timestamp("date").notNull(),
-  groupedId: varchar("grouped_id"), // Новое поле для медиа-групп
-  isMediaGroup: boolean("is_media_group").default(false), // Флаг медиа-группы
-  parentMessageId: varchar("parent_message_id"), // Ссылка на родительское сообщение
+  groupedId: varchar("grouped_id"),
+  isMediaGroup: boolean("is_media_group").default(false),
+  parentMessageId: varchar("parent_message_id"),
   createdAt: timestamp("created_at").defaultNow(),
 });
+
 export const messageMedia = pgTable("message_media", {
   id: text("id")
     .primaryKey()
@@ -74,33 +76,89 @@ export const messageMedia = pgTable("message_media", {
   messageId: text("message_id").references(() => messages.id, {
     onDelete: "cascade",
   }),
-  type: text("type").notNull(), // 'photo', 'video', 'audio', 'voice', 'document'
+  type: text("type").notNull(),
   fileId: text("file_id").notNull(),
   fileUniqueId: text("file_unique_id").notNull(),
   caption: text("caption").default(""),
-
-  // Новые поля для локального хранения
-  localFilePath: text("local_file_path"), // Путь к сохраненному файлу
-  fileName: text("file_name"), // Имя файла на диске
-  originalFileName: text("original_file_name"), // Оригинальное имя файла
-  fileSize: integer("file_size"), // Размер файла в байтах
-  mimeType: text("mime_type"), // MIME тип файла
+  localFilePath: text("local_file_path"),
+  fileName: text("file_name"),
+  originalFileName: text("original_file_name"),
+  fileSize: integer("file_size"),
+  mimeType: text("mime_type"),
   downloadedAt: timestamp("downloaded_at").defaultNow(),
-
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 export const allowedChannels = pgTable("allowed_channels", {
-  id: serial("id").primaryKey(), // Внутрішній ID запису
+  id: serial("id").primaryKey(),
   telegramChannelId: varchar("telegram_channel_id", { length: 255 })
     .notNull()
-    .unique(), // ID каналу з Telegram (може бути великим числом або рядком типу -100xxxx)
-  name: varchar("name", { length: 255 }), // Описова назва каналу (опціонально)
+    .unique(),
+  name: varchar("name", { length: 255 }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+// Новые таблицы для подписок
+export const subscriptionPlans = pgTable("subscription_plans", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 255 }).notNull(),
+  description: text("description"),
+  price: integer("price").notNull(), // Цена в Telegram Stars
+  durationDays: integer("duration_days").notNull(), // Длительность в днях
+  isActive: boolean("is_active").default(true),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const userSubscriptions = pgTable("user_subscriptions", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .references(() => clients.id, {
+      onDelete: "cascade",
+    })
+    .notNull(),
+  subscriptionPlanId: integer("subscription_plan_id")
+    .references(() => subscriptionPlans.id, {
+      onDelete: "cascade",
+    })
+    .notNull(),
+  startDate: timestamp("start_date").defaultNow().notNull(),
+  endDate: timestamp("end_date").notNull(),
+  isActive: boolean("is_active").default(true),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const subscriptionTransactions = pgTable("subscription_transactions", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .references(() => clients.id, {
+      onDelete: "cascade",
+    })
+    .notNull(),
+  subscriptionPlanId: integer("subscription_plan_id")
+    .references(() => subscriptionPlans.id, {
+      onDelete: "cascade",
+    })
+    .notNull(),
+  userSubscriptionId: integer("user_subscription_id").references(
+    () => userSubscriptions.id,
+    {
+      onDelete: "cascade",
+    },
+  ),
+  telegramPaymentChargeId: text("telegram_payment_charge_id").unique(),
+  providerPaymentChargeId: text("provider_payment_charge_id"),
+  amount: integer("amount").notNull(), // Сумма в Telegram Stars
+  currency: varchar("currency", { length: 10 }).default("XTR"), // XTR для Telegram Stars
+  status: varchar("status", { length: 50 }).default("pending"), // pending, completed, failed, refunded
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+// Relations
 export const messagesRelations = relations(messages, ({ many }) => ({
   media: many(messageMedia),
 }));
@@ -119,6 +177,52 @@ export const telegramSessionsRelations = relations(
   }),
 );
 
+export const clientsRelations = relations(clients, ({ many }) => ({
+  subscriptions: many(userSubscriptions),
+  transactions: many(subscriptionTransactions),
+}));
+
+export const subscriptionPlansRelations = relations(
+  subscriptionPlans,
+  ({ many }) => ({
+    userSubscriptions: many(userSubscriptions),
+    transactions: many(subscriptionTransactions),
+  }),
+);
+
+export const userSubscriptionsRelations = relations(
+  userSubscriptions,
+  ({ one, many }) => ({
+    user: one(clients, {
+      fields: [userSubscriptions.userId],
+      references: [clients.id],
+    }),
+    subscriptionPlan: one(subscriptionPlans, {
+      fields: [userSubscriptions.subscriptionPlanId],
+      references: [subscriptionPlans.id],
+    }),
+    transactions: many(subscriptionTransactions),
+  }),
+);
+
+export const subscriptionTransactionsRelations = relations(
+  subscriptionTransactions,
+  ({ one }) => ({
+    user: one(clients, {
+      fields: [subscriptionTransactions.userId],
+      references: [clients.id],
+    }),
+    subscriptionPlan: one(subscriptionPlans, {
+      fields: [subscriptionTransactions.subscriptionPlanId],
+      references: [subscriptionPlans.id],
+    }),
+    userSubscription: one(userSubscriptions, {
+      fields: [subscriptionTransactions.userSubscriptionId],
+      references: [userSubscriptions.id],
+    }),
+  }),
+);
+
 export const table = {
   user,
   clients,
@@ -127,4 +231,7 @@ export const table = {
   messages,
   messageMedia,
   allowedChannels,
+  subscriptionPlans,
+  userSubscriptions,
+  subscriptionTransactions,
 } as const;

@@ -30,4 +30,4 @@ const app = new Elysia({
   .use(subscriptionController)
   .listen({ idleTimeout: 100, port: process.env.PORT! });
 
-console.log(`🚀 Сервер запущено на http://localhost:3000`);
+console.log(`🚀 Сервер запущено на http://localhost:${process.env.PORT!}`);

@@ -8,6 +8,7 @@ import { messageMedia, messages } from "../database/schema";
 import { eq } from "drizzle-orm";
 import * as sharp from "sharp";
 import * as ffmpeg from "fluent-ffmpeg";
+
 export interface MediaFile {
   id: string;
   type: "photo" | "video" | "audio" | "voice" | "document";
@@ -34,6 +35,22 @@ export class TelegramMediaService {
       await fs.mkdir(this.mediaDir, { recursive: true });
     }
   }
+
+  /**
+   * Генерує timestamp для назви файлу у форматі YYYYMMDD_HHMMSS
+   */
+  private generateTimestamp(): string {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const day = String(now.getDate()).padStart(2, "0");
+    const hours = String(now.getHours()).padStart(2, "0");
+    const minutes = String(now.getMinutes()).padStart(2, "0");
+    const seconds = String(now.getSeconds()).padStart(2, "0");
+
+    return `${year}${month}${day}_${hours}${minutes}${seconds}`;
+  }
+
   async downloadAndCompressMedia(
     client: TelegramClient,
     message: Api.Message,
@@ -74,7 +91,7 @@ export class TelegramMediaService {
   }
 
   /**
-   * НОВА ФУНКЦІЯ: Стискає зображення
+   * Стискає зображення
    */
   private async compressImage(
     originalPath: string,
@@ -82,9 +99,10 @@ export class TelegramMediaService {
   ): Promise<string | null> {
     try {
       const parsedPath = path.parse(originalPath);
+      const timestamp = this.generateTimestamp();
       const compressedPath = path.join(
         parsedPath.dir,
-        `${parsedPath.name}_compressed.jpg`,
+        `${parsedPath.name}_${timestamp}_compressed.jpg`,
       );
 
       // Стискаємо зображення з якістю 70% та обмежуємо розмір до 2048x2048
@@ -122,7 +140,7 @@ export class TelegramMediaService {
   }
 
   /**
-   * НОВА ФУНКЦІЯ: Стискає відео
+   * Стискає відео
    */
   private async compressVideo(
     originalPath: string,
@@ -130,9 +148,10 @@ export class TelegramMediaService {
   ): Promise<string | null> {
     try {
       const parsedPath = path.parse(originalPath);
+      const timestamp = this.generateTimestamp();
       const compressedPath = path.join(
         parsedPath.dir,
-        `${parsedPath.name}_compressed.mp4`,
+        `${parsedPath.name}_${timestamp}_compressed.mp4`,
       );
 
       return new Promise((resolve, reject) => {
@@ -186,7 +205,7 @@ export class TelegramMediaService {
   }
 
   /**
-   * НОВА ФУНКЦІЯ: Оновлює шлях до медіа в БД
+   * Оновлює шлях до медіа в БД
    */
   private async updateMediaPath(
     messageDbId: string,
@@ -203,7 +222,7 @@ export class TelegramMediaService {
   }
 
   /**
-   * НОВА ФУНКЦІЯ: Перевіряє розмір файлу після стискання
+   * Перевіряє розмір файлу після стискання
    */
   private async checkCompressedSize(filePath: string): Promise<boolean> {
     try {
@@ -214,6 +233,7 @@ export class TelegramMediaService {
       return false;
     }
   }
+
   async downloadAndSaveMedia(
     client: TelegramClient,
     message: Api.Message,
@@ -225,6 +245,7 @@ export class TelegramMediaService {
       let mediaInfo: any = {};
       let fileExtension = "";
       let fileName = "";
+      const timestamp = this.generateTimestamp(); // Генеруємо timestamp
 
       if (message.media instanceof Api.MessageMediaPhoto) {
         const photo = message.media.photo;
@@ -235,7 +256,7 @@ export class TelegramMediaService {
             fileUniqueId: photo.id.toString(),
           };
           fileExtension = ".jpg";
-          fileName = `photo_${photo.id}${fileExtension}`;
+          fileName = `photo_${photo.id}_${timestamp}${fileExtension}`;
         }
       } else if (message.media instanceof Api.MessageMediaDocument) {
         const doc = message.media.document;
@@ -255,7 +276,9 @@ export class TelegramMediaService {
           fileExtension =
             path.extname(originalFileName) ||
             this.getExtensionByMimeType(doc.mimeType);
-          fileName = `${type}_${doc.id}${fileExtension}`;
+
+          // Додаємо timestamp до назви файлу
+          fileName = `${type}_${doc.id}_${timestamp}${fileExtension}`;
 
           mediaInfo = {
             type,
@@ -292,13 +315,14 @@ export class TelegramMediaService {
         originalFileName: mediaInfo.originalFileName,
       });
 
-      console.log(`📁 Медиафайл сохранен: ${fileName} (${stats.size} bytes)`);
+      console.log(`📁 Медіафайл збережено: ${fileName} (${stats.size} bytes)`);
       return filePath;
     } catch (error) {
-      console.error("Ошибка при скачивании медиафайла:", error);
+      console.error("Помилка при завантаженні медіафайлу:", error);
       return null;
     }
   }
+
   async deleteMediaByMessageId(messageId: string): Promise<void> {
     try {
       // Получаем все медиафайлы для данного сообщения
@@ -435,7 +459,8 @@ export class TelegramMediaService {
 
     const { buffer, mediaInfo } = original;
     const hash = crypto.createHash("md5").update(buffer).digest("hex");
-    const newFileName = `copy_${hash}_${mediaInfo.fileName}`;
+    const timestamp = this.generateTimestamp();
+    const newFileName = `copy_${hash}_${timestamp}_${mediaInfo.fileName}`;
     const newFilePath = path.join(this.mediaDir, newFileName);
 
     try {
@@ -561,6 +586,7 @@ export class TelegramMediaService {
       console.error("Ошибка при очистке старых файлов:", error);
     }
   }
+
   async bulkDeleteMediaByMessageIds(messageIds: string[]): Promise<void> {
     if (messageIds.length === 0) return;
 

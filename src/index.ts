@@ -28,6 +28,6 @@ const app = new Elysia({
   .use(telegramBotController)
   .use(clientController)
   .use(subscriptionController)
-  .listen({ idleTimeout: 100, port: 3000 });
+  .listen({ idleTimeout: 100, port: process.env.PORT! });
 
 console.log(`🚀 Сервер запущено на http://localhost:3000`);

@@ -119,14 +119,17 @@ export const userSubscriptions = pgTable("user_subscriptions", {
       onDelete: "cascade",
     })
     .notNull(),
-  subscriptionPlanId: integer("subscription_plan_id")
-    .references(() => subscriptionPlans.id, {
+  subscriptionPlanId: integer("subscription_plan_id").references(
+    () => subscriptionPlans.id,
+    {
       onDelete: "cascade",
-    })
-    .notNull(),
+    },
+  ), // Видалити .notNull() щоб дозволити null для ручних підписок
   startDate: timestamp("start_date").defaultNow().notNull(),
   endDate: timestamp("end_date").notNull(),
   isActive: boolean("is_active").default(true),
+  isManual: boolean("is_manual").default(false), // Додаткове поле для позначення ручних підписок
+  manualNote: text("manual_note"), // Поле для зберігання нотаток адміна
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

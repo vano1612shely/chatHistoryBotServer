@@ -671,13 +671,16 @@ ${subscriptionPlans
 
     await this.deletePreviousMessages(ctx, userId);
 
-    const firstMessage =
-      await this.messageService.getFirstMessageByChannelId(channelId);
+    // Отримуємо перше повідомлення ТІЛЬКИ з медіафайлами
+    const firstMessage = await this.messageService.getFirstMessageByChannelId(
+      channelId,
+      true, // onlyWithMedia = true
+    );
 
     if (!firstMessage) {
       const keyboard = this.createEmptyChannelKeyboard();
       const message = await ctx.reply(
-        "📭 У цьому каналі наразі немає збережених постів.\n\n💡 Дані можуть з'явитися пізніше, коли канал буде оновлено.",
+        "📭 У цьому каналі наразі немає збережених постів з медіафайлами.\n\n💡 Медіафайли можуть з'явитися пізніше, коли канал буде оновлено.",
         { reply_markup: keyboard },
       );
       this.sessionService.setLastTelegramMessage(userId, message.message_id);
@@ -696,20 +699,21 @@ ${subscriptionPlans
       return;
     }
 
+    // Шукаємо наступне повідомлення ТІЛЬКИ з медіафайлами
     const nextMessage = await this.messageService.getNextMessage(
       currentChannel,
       currentMessage.messageDate,
+      true, // onlyWithMedia = true
     );
 
     if (!nextMessage) {
-      await ctx.answerCbQuery("Це останній пост в каналі");
+      await ctx.answerCbQuery("Це останній пост з медіафайлами в каналі");
       return;
     }
 
     await this.deletePreviousMessages(ctx, userId);
     await this.sendMessageWithNavigation(ctx, nextMessage, userId);
   }
-
   private async handlePrevious(ctx: any, userId: string) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
     const currentMessage = this.sessionService.getCurrentMessage(userId);
@@ -719,13 +723,15 @@ ${subscriptionPlans
       return;
     }
 
+    // Шукаємо попереднє повідомлення ТІЛЬКИ з медіафайлами
     const prevMessage = await this.messageService.getPreviousMessage(
       currentChannel,
       currentMessage.messageDate,
+      true, // onlyWithMedia = true
     );
 
     if (!prevMessage) {
-      await ctx.answerCbQuery("Це перший пост в каналі");
+      await ctx.answerCbQuery("Це перший пост з медіафайлами в каналі");
       return;
     }
 
@@ -778,23 +784,60 @@ ${subscriptionPlans
   ) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
 
+    // Перевіряємо наступне та попереднє повідомлення ТІЛЬКИ з медіафайлами
     const hasNext = !!(await this.messageService.getNextMessage(
       currentChannel!,
       message.date,
+      true, // onlyWithMedia = true
     ));
     const hasPrev = !!(await this.messageService.getPreviousMessage(
       currentChannel!,
       message.date,
+      true, // onlyWithMedia = true
     ));
 
     this.sessionService.setCurrentMessage(userId, message.id, message.date);
 
     const keyboard = this.createNavigationKeyboard(hasNext, hasPrev);
     let messageText = "";
+
     if (message.text && message.text.trim()) {
       messageText = message.text.trim();
     }
-    console.log(message);
+
+    // Додаткова перевірка: якщо повідомлення не має медіафайлів,
+    // автоматично переходимо до наступного
+    if (!message.media || message.media.length === 0) {
+      console.warn(
+        `⚠️ Повідомлення ${message.id} не має медіафайлів, пропускаємо`,
+      );
+
+      // Шукаємо наступне повідомлення з медіа
+      const nextMessage = await this.messageService.getNextMessage(
+        currentChannel!,
+        message.date,
+        true, // onlyWithMedia = true
+      );
+
+      if (nextMessage) {
+        await this.sendMessageWithNavigation(ctx, nextMessage, userId);
+        return;
+      } else {
+        // Якщо немає наступного повідомлення з медіа, показуємо повідомлення
+        const message = await ctx.reply(
+          "📭 Більше постів з медіафайлами в цьому каналі немає.",
+          {
+            reply_markup: {
+              inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
+            },
+          },
+        );
+        this.sessionService.setLastTelegramMessage(userId, message.message_id);
+        return;
+      }
+    }
+
+    // Обробка медіа-груп
     if (message.isMediaGroup && message.groupedId) {
       const mediaGroupItems = await this.getMediaGroupItems(message.id);
 
@@ -856,10 +899,21 @@ ${subscriptionPlans
           }
         } catch (error) {
           console.error("Помилка відправки медіа-групи:", error);
+          // Якщо помилка з медіа-групою, переходимо до наступного повідомлення
+          const nextMessage = await this.messageService.getNextMessage(
+            currentChannel!,
+            message.date,
+            true,
+          );
+          if (nextMessage) {
+            await this.sendMessageWithNavigation(ctx, nextMessage, userId);
+            return;
+          }
         }
       }
     }
 
+    // Обробка одиночних медіафайлів
     if (message.media && message.media.length > 0 && !message.isMediaGroup) {
       const media = message.media[0];
 
@@ -891,9 +945,21 @@ ${subscriptionPlans
             );
           }
         } else {
-          sentMessage = await ctx.reply(messageText, {
-            reply_markup: keyboard,
-          });
+          // Якщо файл відсутній, переходимо до наступного повідомлення
+          console.warn(`⚠️ Медіафайл відсутній для повідомлення ${message.id}`);
+          const nextMessage = await this.messageService.getNextMessage(
+            currentChannel!,
+            message.date,
+            true,
+          );
+          if (nextMessage) {
+            await this.sendMessageWithNavigation(ctx, nextMessage, userId);
+            return;
+          } else {
+            sentMessage = await ctx.reply("📭 Медіафайл недоступний.", {
+              reply_markup: keyboard,
+            });
+          }
         }
 
         this.sessionService.setLastTelegramMessage(
@@ -902,22 +968,52 @@ ${subscriptionPlans
         );
       } catch (error) {
         console.error("Помилка відправки медіа:", error);
-        const sentMessage = await ctx.reply(messageText, {
-          reply_markup: keyboard,
-        });
+        // При помилці відправки медіа переходимо до наступного
+        const nextMessage = await this.messageService.getNextMessage(
+          currentChannel!,
+          message.date,
+          true,
+        );
+        if (nextMessage) {
+          await this.sendMessageWithNavigation(ctx, nextMessage, userId);
+          return;
+        } else {
+          const sentMessage = await ctx.reply(
+            "❌ Помилка завантаження медіафайлу",
+            {
+              reply_markup: keyboard,
+            },
+          );
+          this.sessionService.setLastTelegramMessage(
+            userId,
+            sentMessage.message_id,
+          );
+        }
+      }
+    } else {
+      // Якщо немає медіа, але повідомлення пройшло фільтрацію, переходимо далі
+      console.warn(`⚠️ Повідомлення ${message.id} не має медіа, пропускаємо`);
+      const nextMessage = await this.messageService.getNextMessage(
+        currentChannel!,
+        message.date,
+        true,
+      );
+      if (nextMessage) {
+        await this.sendMessageWithNavigation(ctx, nextMessage, userId);
+      } else {
+        const sentMessage = await ctx.reply(
+          "📭 Більше постів з медіафайлами немає.",
+          {
+            reply_markup: {
+              inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
+            },
+          },
+        );
         this.sessionService.setLastTelegramMessage(
           userId,
           sentMessage.message_id,
         );
       }
-    } else {
-      const sentMessage = await ctx.reply(messageText, {
-        reply_markup: keyboard,
-      });
-      this.sessionService.setLastTelegramMessage(
-        userId,
-        sentMessage.message_id,
-      );
     }
   }
 

@@ -37,10 +37,25 @@ export interface MessageWithMedia {
 }
 
 export class MessageService {
-  // Виправлений метод для створення умови валідних повідомлень
+  // Нова умова: тільки повідомлення з медіафайлами
+  private getValidMessageWithMediaCondition() {
+    return and(
+      // Виключаємо дочірні повідомлення медіа-групи
+      isNull(messages.parentMessageId),
+      // ОБОВ'ЯЗКОВО має мати медіа
+      exists(
+        db
+          .select()
+          .from(messageMedia)
+          .where(eq(messageMedia.messageId, messages.id)),
+      ),
+    );
+  }
+
+  // Стара умова для сумісності (якщо потрібно)
   private getValidMessageCondition() {
     return and(
-      // ОСНОВНЕ: Виключаємо дочірні повідомлення медіа-групи
+      // Виключаємо дочірні повідомлення медіа-групи
       isNull(messages.parentMessageId),
       // Повідомлення має мати текст АБО медіа
       or(
@@ -59,13 +74,16 @@ export class MessageService {
 
   async getFirstMessageByChannelId(
     channelId: string,
+    onlyWithMedia: boolean = true,
   ): Promise<MessageWithMedia | null> {
+    const condition = onlyWithMedia
+      ? this.getValidMessageWithMediaCondition()
+      : this.getValidMessageCondition();
+
     const message = await db
       .select()
       .from(messages)
-      .where(
-        and(eq(messages.channelId, channelId), this.getValidMessageCondition()),
-      )
+      .where(and(eq(messages.channelId, channelId), condition))
       .orderBy(asc(messages.date))
       .limit(1);
 
@@ -76,13 +94,16 @@ export class MessageService {
 
   async getLastMessageByChannelId(
     channelId: string,
+    onlyWithMedia: boolean = true,
   ): Promise<MessageWithMedia | null> {
+    const condition = onlyWithMedia
+      ? this.getValidMessageWithMediaCondition()
+      : this.getValidMessageCondition();
+
     const message = await db
       .select()
       .from(messages)
-      .where(
-        and(eq(messages.channelId, channelId), this.getValidMessageCondition()),
-      )
+      .where(and(eq(messages.channelId, channelId), condition))
       .orderBy(desc(messages.date))
       .limit(1);
 
@@ -94,7 +115,12 @@ export class MessageService {
   async getNextMessage(
     channelId: string,
     currentDate: Date,
+    onlyWithMedia: boolean = true,
   ): Promise<MessageWithMedia | null> {
+    const condition = onlyWithMedia
+      ? this.getValidMessageWithMediaCondition()
+      : this.getValidMessageCondition();
+
     const message = await db
       .select()
       .from(messages)
@@ -102,7 +128,7 @@ export class MessageService {
         and(
           eq(messages.channelId, channelId),
           gt(messages.date, currentDate),
-          this.getValidMessageCondition(),
+          condition,
         ),
       )
       .orderBy(asc(messages.date))
@@ -116,7 +142,12 @@ export class MessageService {
   async getPreviousMessage(
     channelId: string,
     currentDate: Date,
+    onlyWithMedia: boolean = true,
   ): Promise<MessageWithMedia | null> {
+    const condition = onlyWithMedia
+      ? this.getValidMessageWithMediaCondition()
+      : this.getValidMessageCondition();
+
     const message = await db
       .select()
       .from(messages)
@@ -124,7 +155,7 @@ export class MessageService {
         and(
           eq(messages.channelId, channelId),
           lt(messages.date, currentDate),
-          this.getValidMessageCondition(),
+          condition,
         ),
       )
       .orderBy(desc(messages.date))
@@ -195,13 +226,18 @@ export class MessageService {
     };
   }
 
-  async getMessageCount(channelId: string): Promise<number> {
+  async getMessageCount(
+    channelId: string,
+    onlyWithMedia: boolean = true,
+  ): Promise<number> {
+    const condition = onlyWithMedia
+      ? this.getValidMessageWithMediaCondition()
+      : this.getValidMessageCondition();
+
     const result = await db
       .select({ count: count() })
       .from(messages)
-      .where(
-        and(eq(messages.channelId, channelId), this.getValidMessageCondition()),
-      );
+      .where(and(eq(messages.channelId, channelId), condition));
 
     return result[0]?.count || 0;
   }
@@ -209,7 +245,12 @@ export class MessageService {
   async getMessagePosition(
     channelId: string,
     messageDate: Date,
+    onlyWithMedia: boolean = true,
   ): Promise<number> {
+    const condition = onlyWithMedia
+      ? this.getValidMessageWithMediaCondition()
+      : this.getValidMessageCondition();
+
     const result = await db
       .select({ count: count() })
       .from(messages)
@@ -217,10 +258,20 @@ export class MessageService {
         and(
           eq(messages.channelId, channelId),
           lt(messages.date, messageDate),
-          this.getValidMessageCondition(),
+          condition,
         ),
       );
 
     return (result[0]?.count || 0) + 1;
+  }
+
+  // Допоміжний метод для додаткової перевірки наявності медіа
+  async hasMediaFiles(messageId: string): Promise<boolean> {
+    const mediaCount = await db
+      .select({ count: count() })
+      .from(messageMedia)
+      .where(eq(messageMedia.messageId, messageId));
+
+    return (mediaCount[0]?.count || 0) > 0;
   }
 }

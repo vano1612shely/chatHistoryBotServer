@@ -84,7 +84,7 @@ export class MessageService {
       .select()
       .from(messages)
       .where(and(eq(messages.channelId, channelId), condition))
-      .orderBy(asc(messages.date))
+      .orderBy(desc(messages.date)) // Змінено на desc - спочатку найновіші
       .limit(1);
 
     if (message.length === 0) return null;
@@ -104,7 +104,7 @@ export class MessageService {
       .select()
       .from(messages)
       .where(and(eq(messages.channelId, channelId), condition))
-      .orderBy(desc(messages.date))
+      .orderBy(asc(messages.date)) // Змінено на asc - тепер це найстаріше
       .limit(1);
 
     if (message.length === 0) return null;
@@ -121,17 +121,18 @@ export class MessageService {
       ? this.getValidMessageWithMediaCondition()
       : this.getValidMessageCondition();
 
+    // Для сортування від нового до старого: "наступне" - це старіше за поточне
     const message = await db
       .select()
       .from(messages)
       .where(
         and(
           eq(messages.channelId, channelId),
-          gt(messages.date, currentDate),
+          lt(messages.date, currentDate), // Змінено на lt - шукаємо старіші
           condition,
         ),
       )
-      .orderBy(asc(messages.date))
+      .orderBy(desc(messages.date)) // Змінено на desc - найближче старіше
       .limit(1);
 
     if (message.length === 0) return null;
@@ -148,17 +149,18 @@ export class MessageService {
       ? this.getValidMessageWithMediaCondition()
       : this.getValidMessageCondition();
 
+    // Для сортування від нового до старого: "попереднє" - це новіше за поточне
     const message = await db
       .select()
       .from(messages)
       .where(
         and(
           eq(messages.channelId, channelId),
-          lt(messages.date, currentDate),
+          gt(messages.date, currentDate), // Змінено на gt - шукаємо новіші
           condition,
         ),
       )
-      .orderBy(desc(messages.date))
+      .orderBy(asc(messages.date)) // Змінено на asc - найближче новіше
       .limit(1);
 
     if (message.length === 0) return null;
@@ -251,13 +253,14 @@ export class MessageService {
       ? this.getValidMessageWithMediaCondition()
       : this.getValidMessageCondition();
 
+    // Для сортування від нового до старого: рахуємо новіші повідомлення
     const result = await db
       .select({ count: count() })
       .from(messages)
       .where(
         and(
           eq(messages.channelId, channelId),
-          lt(messages.date, messageDate),
+          gt(messages.date, messageDate), // Змінено на gt - рахуємо новіші
           condition,
         ),
       );

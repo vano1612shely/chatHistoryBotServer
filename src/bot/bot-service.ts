@@ -707,13 +707,14 @@ ${subscriptionPlans
     );
 
     if (!nextMessage) {
-      await ctx.answerCbQuery("Це останній пост з медіафайлами в каналі");
+      await ctx.answerCbQuery("Це найстаріший пост з медіафайлами в каналі");
       return;
     }
 
     await this.deletePreviousMessages(ctx, userId);
     await this.sendMessageWithNavigation(ctx, nextMessage, userId);
   }
+
   private async handlePrevious(ctx: any, userId: string) {
     const currentChannel = this.sessionService.getCurrentChannel(userId);
     const currentMessage = this.sessionService.getCurrentMessage(userId);
@@ -731,7 +732,7 @@ ${subscriptionPlans
     );
 
     if (!prevMessage) {
-      await ctx.answerCbQuery("Це перший пост з медіафайлами в каналі");
+      await ctx.answerCbQuery("Це найновіший пост з медіафайлами в каналі");
       return;
     }
 
@@ -1016,7 +1017,6 @@ ${subscriptionPlans
       }
     }
   }
-
   private async getMediaGroupItems(messageId: string) {
     try {
       const mainMessage = await db

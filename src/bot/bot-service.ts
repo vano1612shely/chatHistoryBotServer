@@ -790,20 +790,11 @@ ${subscriptionPlans
     this.sessionService.setCurrentMessage(userId, message.id, message.date);
 
     const keyboard = this.createNavigationKeyboard(hasNext, hasPrev);
-
-    const position = await this.messageService.getMessagePosition(
-      currentChannel!,
-      message.date,
-    );
-    const totalCount = await this.messageService.getMessageCount(
-      currentChannel!,
-    );
-
     let messageText = "";
     if (message.text && message.text.trim()) {
       messageText = message.text.trim();
     }
-
+    console.log(message);
     if (message.isMediaGroup && message.groupedId) {
       const mediaGroupItems = await this.getMediaGroupItems(message.id);
 

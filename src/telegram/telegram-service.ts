@@ -86,12 +86,56 @@ export class TelegramService extends EventEmitter {
       if (update.className === "UpdateDeleteChannelMessages") {
         const u = update as Api.UpdateDeleteChannelMessages;
         const deletedMessageIds = u.messages;
-
+        const channelId = u.channelId?.toString();
         try {
-          await this.handleDeletedMessages(deletedMessageIds);
+          await this.handleDeletedMessages(
+            deletedMessageIds,
+            channelId,
+            "manual",
+          );
         } catch (error) {
           console.error("Error handling deleted messages:", error);
           this.emit("error", error);
+        }
+      }
+
+      // Обработка автоудаления сообщений
+      if (update.className === "UpdateDeleteScheduledMessages") {
+        const u = update as Api.UpdateDeleteScheduledMessages;
+        const deletedMessageIds = u.messages;
+        // У scheduled messages може не бути channelId, тому обробляємо всі канали
+
+        try {
+          await this.handleDeletedMessages(deletedMessageIds, null, "auto");
+        } catch (error) {
+          console.error("Error handling auto-deleted messages:", error);
+          this.emit("error", error);
+        }
+      }
+
+      // Обработка TTL (Time To Live) удаления сообщений
+      if (update.className === "UpdateDeleteMessages") {
+        const u = update as Api.UpdateDeleteMessages;
+        const deletedMessageIds = u.messages;
+
+        try {
+          await this.handleDeletedMessages(deletedMessageIds, null, "ttl");
+        } catch (error) {
+          console.error("Error handling TTL deleted messages:", error);
+          this.emit("error", error);
+        }
+      }
+
+      // Обработка удаления истории чата
+      if (update.className === "UpdateChannelTooLong") {
+        const u = update as Api.UpdateChannelTooLong;
+        const channelId = u.channelId?.toString();
+
+        if (channelId && allowedChannelsService.isChannelAllowed(channelId)) {
+          console.log(
+            `📱 Канал ${channelId}: історія занадто довга, можливо видалено повідомлення`,
+          );
+          this.emit("channelHistoryTooLong", { channelId });
         }
       }
     });
@@ -379,24 +423,31 @@ export class TelegramService extends EventEmitter {
     return this.mediaService;
   }
 
-  private async handleDeletedMessages(messageIds: number[]): Promise<void> {
+  private async handleDeletedMessages(
+    messageIds: number[],
+    channelId?: string | null,
+    deleteType: "manual" | "auto" | "ttl" = "manual",
+  ): Promise<void> {
     try {
-      const messagesToDelete = await db
+      let messagesToDelete = await db
         .select()
         .from(messages)
         .where(inArray(messages.messageId, messageIds));
-
       if (messagesToDelete.length === 0) {
-        console.log(`🔍 Повідомлення для видалення в каналі не знайдено`);
+        console.log(
+          `🔍 Повідомлення для видалення не знайдено (${deleteType}): [${messageIds.join(", ")}]`,
+        );
         return;
       }
 
       const dbMessageIds = messagesToDelete.map((msg) => msg.id);
 
+      // Видаляємо медіа файли
       for (const dbMessageId of dbMessageIds) {
         await this.mediaService.deleteMediaByMessageId(dbMessageId);
       }
 
+      // Видаляємо дочірні повідомлення (для медіа-груп)
       for (const msg of messagesToDelete) {
         const deletedChildMessages = await db
           .delete(messages)
@@ -405,26 +456,38 @@ export class TelegramService extends EventEmitter {
 
         if (deletedChildMessages.length > 0) {
           console.log(
-            `🗑️ Видалено ${deletedChildMessages.length} дочірніх повідомлень для повідомлення ${msg.id}`,
+            `🗑️ Видалено ${deletedChildMessages.length} дочірніх повідомлень для повідомлення ${msg.id} (${deleteType})`,
           );
         }
       }
 
+      // Видаляємо основні повідомлення
       const deletedMessages = await db
         .delete(messages)
         .where(inArray(messages.messageId, messageIds))
         .returning();
 
+      const deleteIcon =
+        deleteType === "auto" ? "⏰" : deleteType === "ttl" ? "⏳" : "🗑️";
+      const deleteDescription =
+        deleteType === "auto"
+          ? "автовидалення"
+          : deleteType === "ttl"
+            ? "TTL видалення"
+            : "ручне видалення";
+
       console.log(
-        `🗑️ Видалено ${deletedMessages.length} повідомлень з каналу: [${messageIds.join(", ")}]`,
+        `${deleteIcon} ${deleteDescription}: видалено ${deletedMessages.length} повідомлень${channelId ? ` з каналу ${channelId}` : ""}: [${messageIds.join(", ")}]`,
       );
 
       this.emit("messagesDeleted", {
         deletedMessageIds: messageIds,
         deletedCount: deletedMessages.length,
+        channelId,
+        deleteType,
       });
     } catch (error) {
-      console.error("Error in handleDeletedMessages:", error);
+      console.error(`Error in handleDeletedMessages (${deleteType}):`, error);
       throw error;
     }
   }

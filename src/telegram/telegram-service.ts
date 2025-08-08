@@ -2,10 +2,11 @@ import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 import { db } from "../database";
 import { messages, telegramSessions } from "../database/schema";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, not } from "drizzle-orm";
 import { EventEmitter } from "events";
 import { TelegramMediaService } from "./media-service";
 import { allowedChannelsService } from "./allowed-channels-service";
+import * as cron from "node-cron";
 
 export interface TelegramConfig {
   apiId: number;
@@ -13,6 +14,8 @@ export interface TelegramConfig {
   sessionString?: string;
   downloadMedia?: boolean;
   mediaDir?: string;
+  enableSync?: boolean; // Включити синхронізацію
+  syncOnStart?: boolean; // Синхронізація при старті
 }
 
 export interface AuthData {
@@ -26,7 +29,7 @@ interface PendingMediaGroup {
   timeout: NodeJS.Timeout;
   channelId: string;
   groupedId: string;
-  mainMessage: Api.Message | null; // Основне повідомлення з текстом
+  mainMessage: Api.Message | null;
 }
 
 export class TelegramService extends EventEmitter {
@@ -37,7 +40,11 @@ export class TelegramService extends EventEmitter {
   private downloadMedia: boolean;
   private stopTimeout: NodeJS.Timeout | null = null;
   private pendingMediaGroups: Map<string, PendingMediaGroup> = new Map();
-  private readonly MEDIA_GROUP_TIMEOUT = 2000; // 2 секунди для медіа-групи
+  private readonly MEDIA_GROUP_TIMEOUT = 2000;
+  private cronJob: any = null;
+  private enableSync: boolean;
+  private syncOnStart: boolean;
+  private isSyncing = false;
 
   constructor(config: TelegramConfig) {
     super();
@@ -52,6 +59,8 @@ export class TelegramService extends EventEmitter {
     );
 
     this.downloadMedia = config.downloadMedia ?? true;
+    this.enableSync = config.enableSync ?? true;
+    this.syncOnStart = config.syncOnStart ?? true;
     this.mediaService = new TelegramMediaService(config.mediaDir);
     this.setupEventHandlers();
   }
@@ -69,7 +78,6 @@ export class TelegramService extends EventEmitter {
           return;
         }
 
-        // ВИПРАВЛЕННЯ: Медіа-група створюється тільки коли є groupedId ТА медіа
         if (
           message.groupedId &&
           message.groupedId.toString().trim() !== "" &&
@@ -77,12 +85,11 @@ export class TelegramService extends EventEmitter {
         ) {
           await this.handleMediaGroupMessage(message, channelId);
         } else {
-          // Звичайне повідомлення (не частина медіа-групи)
           await this.handleSingleMessage(message, channelId);
         }
       }
 
-      // Обработка удаления сообщений
+      // Existing delete handlers...
       if (update.className === "UpdateDeleteChannelMessages") {
         const u = update as Api.UpdateDeleteChannelMessages;
         const deletedMessageIds = u.messages;
@@ -99,12 +106,9 @@ export class TelegramService extends EventEmitter {
         }
       }
 
-      // Обработка автоудаления сообщений
       if (update.className === "UpdateDeleteScheduledMessages") {
         const u = update as Api.UpdateDeleteScheduledMessages;
         const deletedMessageIds = u.messages;
-        // У scheduled messages може не бути channelId, тому обробляємо всі канали
-
         try {
           await this.handleDeletedMessages(deletedMessageIds, null, "auto");
         } catch (error) {
@@ -113,11 +117,9 @@ export class TelegramService extends EventEmitter {
         }
       }
 
-      // Обработка TTL (Time To Live) удаления сообщений
       if (update.className === "UpdateDeleteMessages") {
         const u = update as Api.UpdateDeleteMessages;
         const deletedMessageIds = u.messages;
-
         try {
           await this.handleDeletedMessages(deletedMessageIds, null, "ttl");
         } catch (error) {
@@ -126,7 +128,6 @@ export class TelegramService extends EventEmitter {
         }
       }
 
-      // Обработка удаления истории чата
       if (update.className === "UpdateChannelTooLong") {
         const u = update as Api.UpdateChannelTooLong;
         const channelId = u.channelId?.toString();
@@ -149,24 +150,20 @@ export class TelegramService extends EventEmitter {
     const groupKey = `${channelId}_${groupedId}`;
 
     if (this.pendingMediaGroups.has(groupKey)) {
-      // Додаємо повідомлення до існуючої групи
       const pendingGroup = this.pendingMediaGroups.get(groupKey)!;
       pendingGroup.messages.push(message);
 
-      // Визначаємо основне повідомлення (з текстом або перше за замовчуванням)
       if (message.message && message.message.trim()) {
         pendingGroup.mainMessage = message;
       } else if (!pendingGroup.mainMessage) {
         pendingGroup.mainMessage = message;
       }
 
-      // Скидаємо таймер
       clearTimeout(pendingGroup.timeout);
       pendingGroup.timeout = setTimeout(() => {
         this.processMediaGroup(groupKey);
       }, this.MEDIA_GROUP_TIMEOUT);
     } else {
-      // Створюємо нову групу
       const timeout = setTimeout(() => {
         this.processMediaGroup(groupKey);
       }, this.MEDIA_GROUP_TIMEOUT);
@@ -181,6 +178,216 @@ export class TelegramService extends EventEmitter {
     }
   }
 
+  async syncChannel(channelId: string): Promise<void> {
+    if (!this.isStarted) {
+      throw new Error("Client is not started");
+    }
+
+    console.log(`🔄 Початок синхронізації каналу ${channelId}...`);
+
+    try {
+      const entity = await this.client.getEntity(channelId);
+
+      // Отримуємо всі повідомлення з каналу (по частинах)
+      const telegramMessages = new Set<number>();
+      let offset = 0;
+      const limit = 100;
+      let hasMore = true;
+
+      while (hasMore) {
+        const channelMessages = await this.client.getMessages(entity, {
+          limit,
+          offsetId: offset,
+        });
+
+        if (channelMessages.length === 0) {
+          hasMore = false;
+          break;
+        }
+
+        channelMessages.forEach((msg) => {
+          if (msg instanceof Api.Message) {
+            telegramMessages.add(msg.id);
+          }
+        });
+
+        offset = channelMessages[channelMessages.length - 1].id;
+
+        // Додаємо затримку щоб не перевантажувати API
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      // Отримуємо всі повідомлення з бази для цього каналу
+      const dbMessages = await db
+        .select({ messageId: messages.messageId, id: messages.id })
+        .from(messages)
+        .where(eq(messages.channelId, channelId));
+
+      const dbMessageIds = new Set(dbMessages.map((msg) => msg.messageId));
+
+      // Знаходимо повідомлення для видалення (є в базі, але немає в каналі)
+      const messagesToDelete = dbMessages.filter(
+        (msg) => !telegramMessages.has(msg.messageId),
+      );
+
+      // Видаляємо повідомлення з бази
+      if (messagesToDelete.length > 0) {
+        const messageDbIds = messagesToDelete.map((msg) => msg.id);
+
+        // Видаляємо медіа файли
+        for (const dbId of messageDbIds) {
+          await this.mediaService.deleteMediaByMessageId(dbId);
+        }
+
+        // Видаляємо дочірні повідомлення
+        for (const msg of messagesToDelete) {
+          await db.delete(messages).where(eq(messages.parentMessageId, msg.id));
+        }
+
+        // Видаляємо основні повідомлення
+        await db.delete(messages).where(inArray(messages.id, messageDbIds));
+
+        console.log(
+          `🗑️ Видалено ${messagesToDelete.length} повідомлень з бази для каналу ${channelId}`,
+        );
+      }
+
+      // // Знаходимо нові повідомлення (є в каналі, але немає в базі)
+      // const newMessageIds = Array.from(telegramMessages).filter(
+      //   (msgId) => !dbMessageIds.has(msgId),
+      // );
+      //
+      // // Додаємо нові повідомлення
+      // if (newMessageIds.length > 0) {
+      //   let addedCount = 0;
+      //
+      //   // Обробляємо по частинах щоб не перевантажувати
+      //   const batchSize = 50;
+      //   for (let i = 0; i < newMessageIds.length; i += batchSize) {
+      //     const batch = newMessageIds.slice(i, i + batchSize);
+      //
+      //     const newMessages = await this.client.getMessages(entity, {
+      //       ids: batch,
+      //     });
+      //
+      //     for (const message of newMessages) {
+      //       if (message instanceof Api.Message) {
+      //         try {
+      //           await this.processNewMessage(message, channelId);
+      //           addedCount++;
+      //         } catch (error) {
+      //           console.error(
+      //             `Помилка при додаванні повідомлення ${message.id}:`,
+      //             error,
+      //           );
+      //         }
+      //       }
+      //     }
+      //
+      //     // Затримка між батчами
+      //     await new Promise((resolve) => setTimeout(resolve, 1000));
+      //   }
+      //
+      //   console.log(
+      //     `➕ Додано ${addedCount} нових повідомлень до бази для каналу ${channelId}`,
+      //   );
+      // }
+
+      console.log(`✅ Синхронізація каналу ${channelId} завершена`);
+
+      this.emit("channelSynced", {
+        channelId,
+        deletedCount: messagesToDelete.length,
+        // addedCount: newMessageIds.length,
+      });
+    } catch (error) {
+      console.error(`❌ Помилка синхронізації каналу ${channelId}:`, error);
+      this.emit("syncError", { channelId, error });
+      throw error;
+    }
+  }
+  async syncAllChannels(): Promise<void> {
+    if (this.isSyncing) {
+      console.log("🔄 Синхронізація вже виконується, пропускаємо...");
+      return;
+    }
+
+    this.isSyncing = true;
+    console.log("🔄 Початок повної синхронізації всіх каналів...");
+
+    try {
+      const allowedChannels = Array.from(
+        allowedChannelsService.getAllowedChannelIdsSet().values(),
+      );
+      let syncedCount = 0;
+      let errorCount = 0;
+
+      for (const channelId of allowedChannels) {
+        try {
+          await this.syncChannel(channelId);
+          syncedCount++;
+
+          // Затримка між каналами
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        } catch (error) {
+          console.error(`❌ Помилка синхронізації каналу ${channelId}:`, error);
+          errorCount++;
+        }
+      }
+
+      console.log(
+        `✅ Повна синхронізація завершена: ${syncedCount} каналів синхронізовано, ${errorCount} помилок`,
+      );
+
+      this.emit("fullSyncCompleted", {
+        syncedCount,
+        errorCount,
+        totalChannels: allowedChannels.length,
+      });
+    } catch (error) {
+      console.error("❌ Помилка повної синхронізації:", error);
+      this.emit("fullSyncError", error);
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+  private async processNewMessage(
+    message: Api.Message,
+    channelId: string,
+  ): Promise<void> {
+    if (
+      message.groupedId &&
+      message.groupedId.toString().trim() !== "" &&
+      message.media
+    ) {
+      // Для медіа-групи під час синхронізації обробляємо одразу
+      await this.handleSingleMessage(message, channelId);
+    } else {
+      await this.handleSingleMessage(message, channelId);
+    }
+  }
+  private setupDailySync(): void {
+    if (!this.enableSync) return;
+
+    // Щодня о 02:00
+    this.cronJob = cron.schedule(
+      "0 2 * * *",
+      async () => {
+        console.log("🕐 Запуск щоденної синхронізації каналів...");
+        try {
+          await this.syncAllChannels();
+        } catch (error) {
+          console.error("❌ Помилка щоденної синхронізації:", error);
+        }
+      },
+      {
+        timezone: "Europe/Kiev",
+      },
+    );
+
+    this.cronJob.start();
+    console.log("⏰ Налаштовано щоденну синхронізацію каналів (02:00)");
+  }
   private async processMediaGroup(groupKey: string) {
     const pendingGroup = this.pendingMediaGroups.get(groupKey);
     if (!pendingGroup) return;
@@ -640,9 +847,24 @@ export class TelegramService extends EventEmitter {
           this.emit("authError", err);
         },
       })
-      .then(() => {
+      .then(async () => {
         this.isStarted = true;
         console.log("🟢 Telegram userbot запущено!");
+
+        // Налаштовуємо щоденну синхронізацію
+        this.setupDailySync();
+
+        // Запускаємо початкову синхронізацію
+        if (this.syncOnStart) {
+          console.log("🔄 Запуск початкової синхронізації...");
+          // Запускаємо в фоні
+          setTimeout(() => {
+            this.syncAllChannels().catch((error) => {
+              console.error("❌ Помилка початкової синхронізації:", error);
+            });
+          }, 5000); // Затримка 5 секунд після старту
+        }
+
         this.emit("started");
       });
 
@@ -667,6 +889,15 @@ export class TelegramService extends EventEmitter {
     try {
       console.log("🔄 Stopping Telegram client...");
 
+      // Зупиняємо cron завдання
+      if (this.cronJob) {
+        this.cronJob.stop();
+        this.cronJob.destroy();
+        this.cronJob = null;
+        console.log("⏰ Щоденна синхронізація зупинена");
+      }
+
+      // Existing stop logic...
       for (const [key, pendingGroup] of this.pendingMediaGroups) {
         clearTimeout(pendingGroup.timeout);
         await this.processMediaGroup(key);
@@ -714,7 +945,6 @@ export class TelegramService extends EventEmitter {
       this.cleanup();
     }
   }
-
   private forceStop(): void {
     console.log("🚨 Force stopping Telegram client...");
 
@@ -734,10 +964,18 @@ export class TelegramService extends EventEmitter {
   private cleanup(): void {
     this.isStarted = false;
     this.startPromise = null;
+    this.isSyncing = false;
 
     if (this.stopTimeout) {
       clearTimeout(this.stopTimeout);
       this.stopTimeout = null;
+    }
+
+    // Зупиняємо cron завдання
+    if (this.cronJob) {
+      this.cronJob.stop();
+      this.cronJob.destroy();
+      this.cronJob = null;
     }
 
     // Очищаем pending медиа-группы
@@ -749,7 +987,16 @@ export class TelegramService extends EventEmitter {
     console.log("🔴 Telegram userbot зупинено!");
     this.emit("stopped");
   }
+  isSyncInProgress(): boolean {
+    return this.isSyncing;
+  }
 
+  getSyncConfig(): { enableSync: boolean; syncOnStart: boolean } {
+    return {
+      enableSync: this.enableSync,
+      syncOnStart: this.syncOnStart,
+    };
+  }
   async quickStop(): Promise<void> {
     console.log("⚡ Quick stopping Telegram client...");
     this.forceStop();

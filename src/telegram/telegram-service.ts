@@ -371,7 +371,7 @@ export class TelegramService extends EventEmitter {
 
     // Щодня о 02:00
     this.cronJob = cron.schedule(
-      "0 2 * * *",
+      "0 */2 * * *",
       async () => {
         console.log("🕐 Запуск щоденної синхронізації каналів...");
         try {

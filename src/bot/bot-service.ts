@@ -201,6 +201,7 @@ export class BotService {
           caption: messageData.message,
           parse_mode: "HTML" as const,
           reply_markup: keyboard,
+          protect_content: true, // Додано захист контенту
         };
 
         switch (messageData.mediaType) {
@@ -243,6 +244,7 @@ export class BotService {
           {
             parse_mode: "HTML",
             reply_markup: keyboard,
+            protect_content: true, // Додано захист контенту
           },
         );
       }
@@ -347,17 +349,20 @@ ${subscriptionPlans
           {
             caption: subscriptionMessage,
             reply_markup: keyboard,
+            protect_content: true, // Додано захист контенту
           },
         );
       } catch (imageError) {
         console.error("Помилка відправки картинки:", imageError);
         message = await ctx.reply(subscriptionMessage, {
           reply_markup: keyboard,
+          protect_content: true, // Додано захист контенту
         });
       }
     } else {
       message = await ctx.reply(subscriptionMessage, {
         reply_markup: keyboard,
+        protect_content: true, // Додано захист контенту
       });
     }
 
@@ -404,17 +409,20 @@ ${subscriptionPlans
               {
                 caption: botData.startMessage,
                 reply_markup: keyboard,
+                protect_content: true, // Додано захист контенту
               },
             );
           } catch (imageError) {
             console.error("Помилка відправки картинки:", imageError);
             message = await ctx.reply(botData.startMessage, {
               reply_markup: keyboard,
+              protect_content: true, // Додано захист контенту
             });
           }
         } else {
           message = await ctx.reply(botData.startMessage, {
             reply_markup: keyboard,
+            protect_content: true, // Додано захист контенту
           });
         }
 
@@ -432,24 +440,29 @@ ${subscriptionPlans
             {
               caption: botData.startMessage,
               reply_markup: keyboard,
+              protect_content: true, // Додано захист контенту
             },
           );
         } catch (imageError) {
           console.error("Помилка відправки картинки:", imageError);
           message = await ctx.reply(botData.startMessage, {
             reply_markup: keyboard,
+            protect_content: true, // Додано захист контенту
           });
         }
       } else {
         message = await ctx.reply(botData.startMessage, {
           reply_markup: keyboard,
+          protect_content: true, // Додано захист контенту
         });
       }
 
       this.sessionService.setLastTelegramMessage(userId, message.message_id);
     } catch (error) {
       console.error("Помилка обробки start логіки:", error);
-      await ctx.reply("Виникла помилка, спробуйте пізніше");
+      await ctx.reply("Виникла помилка, спробуйте пізніше", {
+        protect_content: true, // Додано захист контенту
+      });
     }
   }
 
@@ -490,7 +503,9 @@ ${subscriptionPlans
         }
       } catch (error) {
         console.error("Помилка обробки callback:", error);
-        await ctx.reply("Виникла помилка, спробуйте пізніше");
+        await ctx.reply("Виникла помилка, спробуйте пізніше", {
+          protect_content: true, // Додано захист контенту
+        });
       }
     });
 
@@ -537,11 +552,17 @@ ${subscriptionPlans
 
         await ctx.reply(
           "🎉 Оплата успішна! Ви отримали доступ до всіх функцій бота!",
+          {
+            protect_content: true, // Додано захист контенту
+          },
         );
       } catch (error) {
         console.error("Помилка обробки успішного платежу:", error);
         await ctx.reply(
           "Виникла помилка при обробці платежу. Зверніться до підтримки.",
+          {
+            protect_content: true, // Додано захист контенту
+          },
         );
       }
     });
@@ -556,7 +577,9 @@ ${subscriptionPlans
   private async handleMySubscription(ctx: any, userId: string, botData: any) {
     const user = await this.userService.findUserByTelegramId(userId);
     if (!user) {
-      await ctx.reply("Користувача не знайдено");
+      await ctx.reply("Користувача не знайдено", {
+        protect_content: true, // Додано захист контенту
+      });
       return;
     }
 
@@ -564,7 +587,9 @@ ${subscriptionPlans
       await this.subscriptionService.getUserActiveSubscription(user.id);
 
     if (!subscription) {
-      await ctx.reply("У вас немає активної підписки");
+      await ctx.reply("У вас немає активної підписки", {
+        protect_content: true, // Додано захист контенту
+      });
       return;
     }
 
@@ -591,6 +616,7 @@ ${subscriptionPlans
     await this.deletePreviousMessages(ctx, userId);
     const message = await ctx.reply(subscriptionInfo, {
       reply_markup: keyboard,
+      protect_content: true, // Додано захист контенту
     });
     this.sessionService.setLastTelegramMessage(userId, message.message_id);
   }
@@ -604,7 +630,9 @@ ${subscriptionPlans
     const plan = await this.subscriptionService.getSubscriptionPlanById(planId);
 
     if (!plan) {
-      await ctx.reply("Помилка: План підписки не знайдено");
+      await ctx.reply("Помилка: План підписки не знайдено", {
+        protect_content: true, // Додано захист контенту
+      });
       return;
     }
 
@@ -622,6 +650,7 @@ ${subscriptionPlans
         prices: [{ label: plan.name, amount: plan.price }],
         max_tip_amount: 0,
         suggested_tip_amounts: [],
+        protect_content: true, // Додано захист контенту
       };
 
       await ctx.replyWithInvoice(invoice);
@@ -629,6 +658,9 @@ ${subscriptionPlans
       console.error("Помилка створення інвойсу:", error);
       await ctx.reply(
         "Помилка при створенні платіжного запиту. Спробуйте пізніше.",
+        {
+          protect_content: true, // Додано захист контенту
+        },
       );
     }
   }
@@ -681,7 +713,10 @@ ${subscriptionPlans
       const keyboard = this.createEmptyChannelKeyboard();
       const message = await ctx.reply(
         "📭 У цьому каналі наразі немає збережених постів з медіафайлами.\n\n💡 Медіафайли можуть з'явитися пізніше, коли канал буде оновлено.",
-        { reply_markup: keyboard },
+        {
+          reply_markup: keyboard,
+          protect_content: true, // Додано захист контенту
+        },
       );
       this.sessionService.setLastTelegramMessage(userId, message.message_id);
       return;
@@ -695,7 +730,9 @@ ${subscriptionPlans
     const currentMessage = this.sessionService.getCurrentMessage(userId);
 
     if (!currentChannel || !currentMessage) {
-      await ctx.reply("Помилка: втрачено контекст сесії");
+      await ctx.reply("Помилка: втрачено контекст сесії", {
+        protect_content: true, // Додано захист контенту
+      });
       return;
     }
 
@@ -720,7 +757,9 @@ ${subscriptionPlans
     const currentMessage = this.sessionService.getCurrentMessage(userId);
 
     if (!currentChannel || !currentMessage) {
-      await ctx.reply("Помилка: втрачено контекст сесії");
+      await ctx.reply("Помилка: втрачено контекст сесії", {
+        protect_content: true, // Додано захист контенту
+      });
       return;
     }
 
@@ -831,6 +870,7 @@ ${subscriptionPlans
             reply_markup: {
               inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
             },
+            protect_content: true, // Додано захист контенту
           },
         );
         this.sessionService.setLastTelegramMessage(userId, message.message_id);
@@ -884,12 +924,15 @@ ${subscriptionPlans
           }
 
           if (mediaGroup.length > 0) {
-            const sentMessages = await ctx.replyWithMediaGroup(mediaGroup);
+            const sentMessages = await ctx.replyWithMediaGroup(mediaGroup, {
+              protect_content: true, // Додано захист контенту для медіа-груп
+            });
             const messageIds = sentMessages.map((msg: any) => msg.message_id);
             this.sessionService.setMediaGroupMessageIds(userId, messageIds);
 
             const navigationMessage = await ctx.reply(`Навігація`, {
               reply_markup: keyboard,
+              protect_content: true, // Додано захист контенту
             });
 
             this.sessionService.setLastTelegramMessage(
@@ -927,22 +970,38 @@ ${subscriptionPlans
           if (media.type === "photo") {
             sentMessage = await ctx.replyWithPhoto(
               { source: buffer },
-              { caption: messageText, reply_markup: keyboard },
+              {
+                caption: messageText,
+                reply_markup: keyboard,
+                protect_content: true, // Додано захист контенту
+              },
             );
           } else if (media.type === "video") {
             sentMessage = await ctx.replyWithVideo(
               { source: buffer },
-              { caption: messageText, reply_markup: keyboard },
+              {
+                caption: messageText,
+                reply_markup: keyboard,
+                protect_content: true, // Додано захист контенту
+              },
             );
           } else if (media.type === "audio") {
             sentMessage = await ctx.replyWithAudio(
               { source: buffer },
-              { caption: messageText, reply_markup: keyboard },
+              {
+                caption: messageText,
+                reply_markup: keyboard,
+                protect_content: true, // Додано захист контенту
+              },
             );
           } else {
             sentMessage = await ctx.replyWithDocument(
               { source: buffer },
-              { caption: messageText, reply_markup: keyboard },
+              {
+                caption: messageText,
+                reply_markup: keyboard,
+                protect_content: true, // Додано захист контенту
+              },
             );
           }
         } else {
@@ -959,6 +1018,7 @@ ${subscriptionPlans
           } else {
             sentMessage = await ctx.reply("📭 Медіафайл недоступний.", {
               reply_markup: keyboard,
+              protect_content: true, // Додано захист контенту
             });
           }
         }
@@ -983,6 +1043,7 @@ ${subscriptionPlans
             "❌ Помилка завантаження медіафайлу",
             {
               reply_markup: keyboard,
+              protect_content: true, // Додано захист контенту
             },
           );
           this.sessionService.setLastTelegramMessage(
@@ -1008,6 +1069,7 @@ ${subscriptionPlans
             reply_markup: {
               inline_keyboard: [[{ text: "❌ Назад", callback_data: "exit" }]],
             },
+            protect_content: true, // Додано захист контенту
           },
         );
         this.sessionService.setLastTelegramMessage(
